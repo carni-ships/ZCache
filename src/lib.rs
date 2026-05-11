@@ -1,11 +1,11 @@
-//! CPU MSM Implementation - v17 (Corrected)
+//! CPU MSM Implementation - v18
 //!
 //! Optimizations:
 //! 1. **Adaptive Window Sizing** - Optimal w based on n  
 //! 2. **Batch Point Doubling** - Pre-computed doubling chains
 //! 3. **Parallel Window-First** - Each thread processes one window
-//! 4. **Interleaved Processing** - Cache-friendly access patterns
-//! 5. **Bucket Skip Optimization** - Skip bucket 0 (always identity)
+//! 4. **Cache-Friendly Interleaving** - Optimized for medium inputs
+//! 5. **Identity Skip Optimization** - Skip zero buckets
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
 use rayon::prelude::*;
@@ -430,7 +430,7 @@ mod tests {
         let sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384];
 
         println!("\n================================================================================");
-        println!("           CPU MSM Performance - v16 (Clean)");
+        println!("           CPU MSM Performance - v18");
         println!("================================================================================");
         println!("");
         println!("| Points |    Naive  |  Serial   |  Parallel  | vs Bellman |");
