@@ -430,11 +430,11 @@ mod tests {
         let sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384];
 
         println!("\n================================================================================");
-        println!("           CPU MSM Performance - v18");
+        println!("           CPU MSM Performance - v18 (Measured vs Bellman)");
         println!("================================================================================");
         println!("");
-        println!("| Points |    Naive  |  Serial   |  Parallel  | vs Bellman |");
-        println!("|--------|----------|-----------|------------|------------|");
+        println!("| Points |  Bellman |    Naive  |  Serial   |  Parallel  | Speedup |");
+        println!("|--------|----------|----------|-----------|------------|---------|");
 
         for n in sizes {
             let bases: Vec<G1Affine> = (0..n)
@@ -481,8 +481,8 @@ mod tests {
             };
             let vs_bellman = if bellman_ms > 0.0 && par_time > 0.0 { bellman_ms / par_time } else { 0.0 };
 
-            println!("| {:>6} | {:>8.2}ms | {:>9.2}ms | {:>10.2}ms | {:>10.1}x |", 
-                     n, naive_time, serial_time, par_time, vs_bellman);
+            println!("| {:>6} | {:>8.1}ms | {:>8.2}ms | {:>9.2}ms | {:>10.2}ms | {:>7.1}x |", 
+                     n, bellman_ms, naive_time, serial_time, par_time, vs_bellman);
         }
         println!("");
     }
