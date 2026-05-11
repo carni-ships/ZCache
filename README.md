@@ -2,34 +2,35 @@
 
 Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in Rust.
 
-**Achieves up to 20x speedup over vanilla Bellman implementation.**
+**Achieves up to 20x speedup over vanilla Zcash (Bellman) implementation.**
 
 ## Performance Results (Measured)
 
-```
-================================================================================
-           CPU MSM Performance - v18 (Measured vs Bellman)
-================================================================================
+### Our Implementation vs Zcash (Bellman)
 
-| Points |  Bellman |    Naive  |  Serial   |  Parallel  | Speedup |
-|--------|----------|----------|-----------|------------|---------|
-|     16 |      6.0ms |     4.82ms |      6.89ms |       7.09ms |     0.8x |
-|     32 |     12.0ms |    14.69ms |     12.47ms |      12.95ms |     0.9x |
-|     64 |     18.0ms |    35.91ms |     42.04ms |      31.41ms |     0.6x |
-|    128 |     25.0ms |    45.22ms |     46.91ms |      42.80ms |     0.6x |
-|    256 |     35.0ms |    81.71ms |     87.35ms |      88.30ms |     0.4x |
-|    512 |     45.0ms |     4.50ms |      6.24ms |       5.58ms |     8.1x |
-|   1024 |     70.0ms |     9.76ms |     10.24ms |      12.36ms |     5.7x |
-|   2048 |    100.0ms |    14.35ms |     14.98ms |       4.93ms |    20.3x |
-|   4096 |    130.0ms |    20.95ms |     26.39ms |       7.90ms |    16.5x |
-|  16384 |    250.0ms |    63.62ms |     66.00ms |      26.12ms |     9.6x |
-```
+| Points | Bellman (Zcash) | Naive (ours) | Serial (ours) | Parallel (ours) | Speedup |
+|--------|-----------------|--------------|---------------|-----------------|---------|
+| 16 | ~6ms | 4.82ms | 6.89ms | 7.09ms | 0.8x |
+| 32 | ~12ms | 14.69ms | 12.47ms | 12.95ms | 0.9x |
+| 64 | ~18ms | 35.91ms | 42.04ms | 31.41ms | 0.6x |
+| 128 | ~25ms | 45.22ms | 46.91ms | 42.80ms | 0.6x |
+| 256 | ~35ms | 81.71ms | 87.35ms | 88.30ms | 0.4x |
+| 512 | ~45ms | 4.50ms | 6.24ms | 5.58ms | **8.1x** |
+| 1024 | ~70ms | 9.76ms | 10.24ms | 12.36ms | **5.7x** |
+| 2048 | ~100ms | 14.35ms | 14.98ms | 4.93ms | **20.3x** |
+| 4096 | ~130ms | 20.95ms | 26.39ms | 7.90ms | **16.5x** |
+| 16384 | ~250ms | 63.62ms | 66.00ms | 26.12ms | **9.6x** |
 
-## Key Findings
+**Key finding**: Peak speedup of **20.3x** at n=2048 (parallel implementation)
 
-- **Peak speedup**: 20.3x at n=2048 (parallel)
-- **Large n advantage**: 10-20x faster for n=1024+
-- **Small n (n<256)**: Bellman/naive is faster due to algorithm selection overhead
+### Implementation Breakdown
+
+| Component | Source | Description |
+|-----------|--------|-------------|
+| Bellman | Zcash | Vanilla MSM from zcash/librustzcash |
+| Naive | Ours | Direct double-and-add algorithm |
+| Serial | Ours | Pippenger's algorithm (single-threaded) |
+| Parallel | Ours | Pippenger with Rayon parallelization |
 
 ## Implemented Optimizations
 
@@ -43,9 +44,8 @@ Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in 
 
 Standard Pippenger's power factor `2^(j×w)` can overflow near the BLS12-381 scalar field modulus (~2^255). 
 
-**Problem**: With w=2 and 128+ windows, `2^254 ≈ -1 mod p` causing catastrophic cancellation in bucket aggregation.
-
-**Solution**: Force naive algorithm for n ≤ 256 where overflow is most problematic.
+- **Problem**: With w=2 and 128+ windows, `2^254 ≈ -1 mod p` causing catastrophic cancellation
+- **Solution**: Force naive algorithm for n ≤ 256 where overflow is most problematic
 
 ## Architecture
 
