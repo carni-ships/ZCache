@@ -1,0 +1,19 @@
+[package]
+name = "cpu-msm-optimized"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bls12_381 = { version = "0.8", features = ["groups"] }
+bellman = { version = "0.14" }
+rayon = "1.10"
+lazy_static = "1.4"
+rand = "0.8"
+group = "0.13"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "bench"
+harness = false
