@@ -2,6 +2,8 @@
 
 Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in pure Rust.
 
+> **Benchmark Environment**: MacBook Pro with M3 Pro (18-core CPU), 18GB RAM, macOS
+
 ## Performance vs Bellman
 
 | n | Bellman | Ours | Winner | Speedup |
