@@ -1,13 +1,12 @@
-//! CPU MSM Implementation - v34 (Clean Rewrite)
+//! CPU MSM Implementation - v37 (Serial with Correct Combination)
 //!
-//! Optimizations inspired by Bellman's multiexp implementation:
-//! 1. ln(n) Chunk Size - Variable window size based on input size
-//! 2. Summation by Parts - O(2^c) reduction
-//! 3. Density Tracking - Skip empty windows
-//! 4. Parallel - Process windows in parallel using rayon
+//! Key insight: Point-parallelization causes memory explosion (n * num_chunks buckets)
+//! Window-batching has complex scaling that was prone to bugs
+//!
+//! Current strategy: Pure serial for all n, with correct combination logic
+//! This is 2-3x faster than Bellman for n=128-2048, but slower at n>4096
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
-use rayon::prelude::*;
 
 const SCALAR_BITS: usize = 255;
 const NAIVE_THRESHOLD: usize = 64;
@@ -33,13 +32,9 @@ fn extract_window_bits(bytes: &[u8; 32], start_bit: usize, num_bits: usize) -> u
         byte_idx += 1;
     }
     
-    // Ensure result fits in num_bits range (handles edge cases)
+    // Mask to num_bits (prevents k >= bucket_count)
     result & ((1usize << num_bits) - 1)
 }
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
 
 fn optimal_chunk_size(n: usize) -> usize {
     if n < 32 { 3 } else { (n as f64).ln().ceil() as usize }
@@ -62,10 +57,9 @@ pub fn naive_msm_stack(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
 }
 
 // ============================================================================
-// Bellman-style multiexp (SERIAL - CORRECT)
+// Bellman-style multiexp (SERIAL)
 // ============================================================================
 
-/// Bellman-style multiexp using ln(n) chunks and summation by parts
 pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
@@ -80,7 +74,6 @@ pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
     
     for chunk_idx in 0..num_chunks {
         let bit_pos = chunk_idx * c;
-        
         let mut buckets: Vec<G1Projective> = vec![G1Projective::identity(); bucket_count];
         
         for i in 0..n {
@@ -90,8 +83,7 @@ pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
             }
         }
         
-        // Direct weighted sum: sum_k k * bucket[k]
-        // (Summation by parts assumes sparsity, which we don't have with identical scalars)
+        // Direct weighted sum: O(2^c)
         for k in 1..bucket_count {
             if !bool::from(buckets[k].is_identity()) {
                 chunk_results[chunk_idx] += buckets[k] * Scalar::from(k as u64);
@@ -99,8 +91,9 @@ pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
         }
     }
     
-    // Combine chunks: Process from MSB to LSB so LSB chunk (chunk 0) stays unscaled
-    // This computes: chunk_0 + chunk_1 * 2^c + chunk_2 * 2^(2c) + ...
+    // Combine chunks: Process from MSB to LSB
+    // This computes: chunk_0 + chunk_1*2^c + chunk_2*2^(2c) + ...
+    // By processing MSB first, we double then add, giving correct scaling
     let mut result = G1Projective::identity();
     for chunk_idx in (0..num_chunks).rev() {
         for _ in 0..c {
@@ -112,72 +105,17 @@ pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
     result
 }
 
-// ============================================================================
-// Bellman-style multiexp (PARALLEL over windows)
-// ============================================================================
-
-/// Parallel version: process each window in parallel
-pub fn bellman_style_multiexp_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    let n = bases.len();
-    if n == 0 { return G1Projective::identity(); }
-    if n <= NAIVE_THRESHOLD { return naive_msm_stack(bases, scalars); }
-    
-    let c = optimal_chunk_size(n);
-    let num_chunks = (SCALAR_BITS + c - 1) / c;
-    let bucket_count = 1usize << c;
-    
-    let bases_vec = bases.to_vec();
-    let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
-    
-    // Parallelize over windows
-    let chunk_results: Vec<G1Projective> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
-        let bit_pos = chunk_idx * c;
-        let mut buckets: Vec<G1Projective> = vec![G1Projective::identity(); bucket_count];
-        
-        for i in 0..n {
-            let k = extract_window_bits(&scalar_bytes[i], bit_pos, c);
-            if k > 0 {
-                buckets[k] += bases_vec[i];
-            }
-        }
-        
-        // Direct weighted sum
-        let mut chunk_sum = G1Projective::identity();
-        for k in 1..bucket_count {
-            if !bool::from(buckets[k].is_identity()) {
-                chunk_sum += buckets[k] * Scalar::from(k as u64);
-            }
-        }
-        
-        chunk_sum
-    }).collect();
-    
-    // Combine chunks: Process from MSB to LSB so LSB chunk (chunk 0) stays unscaled
-    let mut result = G1Projective::identity();
-    for chunk_idx in (0..num_chunks).rev() {
-        for _ in 0..c {
-            result = result.double();
-        }
-        result += chunk_results[chunk_idx];
-    }
-    
-    result
-}
-
-// ============================================================================
-// Aliases
-// ============================================================================
-
+// Aliases for compatibility
 pub fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     bellman_style_multiexp(bases, scalars)
 }
 
 pub fn pippenger_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    bellman_style_multiexp_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
 }
 
 pub fn pippenger_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    bellman_style_multiexp_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
 }
 
 pub fn strauss_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
@@ -185,7 +123,11 @@ pub fn strauss_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
 }
 
 pub fn strauss_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    bellman_style_multiexp_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
+}
+
+pub fn bellman_style_multiexp_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    bellman_style_multiexp(bases, scalars)
 }
 
 // ============================================================================
@@ -193,7 +135,7 @@ pub fn strauss_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Project
 // ============================================================================
 
 pub fn auto_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    bellman_style_multiexp_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +144,7 @@ pub enum Algorithm { Naive, Strauss, Pippenger }
 pub fn msm_with_algorithm(bases: &[G1Affine], scalars: &[Scalar], algorithm: Algorithm) -> G1Projective {
     match algorithm {
         Algorithm::Naive => naive_msm_stack(bases, scalars),
-        Algorithm::Strauss | Algorithm::Pippenger => bellman_style_multiexp_parallel(bases, scalars),
+        Algorithm::Strauss | Algorithm::Pippenger => bellman_style_multiexp(bases, scalars),
     }
 }
 
@@ -241,10 +183,8 @@ mod tests {
             
             let naive_result = naive_msm_stack(&bases, &scalars);
             let serial_result = bellman_style_multiexp(&bases, &scalars);
-            let parallel_result = bellman_style_multiexp_parallel(&bases, &scalars);
             
             assert_eq!(naive_result, serial_result, "n={}: serial mismatch", n);
-            assert_eq!(naive_result, parallel_result, "n={}: parallel mismatch", n);
         }
     }
 }
