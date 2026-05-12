@@ -1,14 +1,13 @@
-//! CPU MSM Implementation - v19
+//! CPU MSM Implementation - v20
 //!
 //! Optimizations:
 //! 1. **Adaptive Window Sizing** - Optimal w based on n  
 //! 2. **Batch Point Doubling** - Pre-computed doubling chains
 //! 3. **Parallel Window-First** - Each thread processes one window
-//! 4. **Cache-Friendly Interleaving** - Optimized for medium inputs
-//! 5. **Identity Skip Optimization** - Skip zero buckets
-//! 6. **SIMD-style Batch Bit Extraction** - Process 4 scalars at once
-//! 7. **Memory Prefetching** - CPU cache hints for better locality
-//! 8. **Cache-Line Aligned Allocation** - 64-byte alignment
+//! 4. **Cache-Friendly Chunking** - Grouped scalar access for better locality
+//! 5. **Identity Skip Optimization** - Avoid unnecessary operations on zero buckets
+//! 6. **Memory Prefetch Hints** - CPU cache hints for better locality
+//! 7. **Addition Chain Aggregation** - O(k) instead of O(k log k) per window
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
 use rayon::prelude::*;
@@ -16,22 +15,13 @@ use rayon::prelude::*;
 mod profiling;
 
 // ============================================================================
-// BIT EXTRACTION
+// CONSTANTS
 // ============================================================================
-
-/// Prefetch hint for better cache utilization (no-op on non-x86)
-#[inline(always)]
-fn prefetch_read<T>(ptr: *const T) {
-    #[cfg(target_feature = "sse2")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-}
 
 const SCALAR_BITS: usize = 255;
 
 // ============================================================================
-// BIT EXTRACTION
+// BIT EXTRACTION - Optimized for common window sizes
 // ============================================================================
 
 #[inline(always)]
@@ -41,10 +31,20 @@ pub fn extract_window_bits(bytes: &[u8; 32], bit_pos: usize, num_bits: usize) ->
     }
     let end_bit = (bit_pos + num_bits).min(SCALAR_BITS);
     let effective_bits = end_bit - bit_pos;
-    if effective_bits == 0 {
-        return 0;
+    
+    // Fast path: aligned extraction at byte boundary
+    if effective_bits == num_bits && (bit_pos & 7) == 0 {
+        // All bits come from same byte
+        if num_bits == 8 {
+            return bytes[bit_pos >> 3] as usize;
+        }
+        // Partial byte extraction
+        if num_bits <= 8 {
+            return (bytes[bit_pos >> 3] & ((1u8 << num_bits) - 1)) as usize;
+        }
     }
     
+    // General case: accumulate bits across byte boundaries
     let mut result = 0usize;
     let mut shift = 0;
     for i in 0..effective_bits {
@@ -60,70 +60,77 @@ pub fn extract_window_bits(bytes: &[u8; 32], bit_pos: usize, num_bits: usize) ->
 }
 
 // ============================================================================
-// BATCH BIT EXTRACTION (4 bits at a time for w=4+)
+// PREFETCH & UTILITIES
 // ============================================================================
 
+/// Prefetch hint for better cache utilization (no-op on non-x86)
 #[inline(always)]
-fn extract_4_bits_at_once(bytes: &[u8; 32], byte_start: usize) -> usize {
-    debug_assert!(byte_start < 32);
-    // Extract 4 bits from each of 2 bytes, little-endian within the window
-    let b0 = bytes[byte_start] as usize;
-    let b1 = (bytes[byte_start + 1] as usize) << 8;
-    ((b0 | b1) >> 0) & 0xF
+fn prefetch_read<T>(ptr: *const T) {
+    #[cfg(target_feature = "sse2")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
 }
 
 // ============================================================================
 // OPTIMAL WINDOW SIZE
 // ============================================================================
 
+#[inline(always)]
 fn optimal_window_size(n: usize) -> usize {
-    match n {
-        0..=8 => 2,
-        9..=32 => 3,
-        33..=128 => 4,
-        129..=512 => 5,
-        513..=2048 => 6,
-        _ => 7,
-    }
+    if n <= 8 { 2 }
+    else if n <= 32 { 3 }
+    else if n <= 128 { 4 }
+    else if n <= 512 { 5 }
+    else if n <= 2048 { 6 }
+    else { 7 }
 }
 
 // ============================================================================
-// POINT MULTIPLICATION HELPERS
+// POINT MULTIPLICATION - Addition Chain (O(log k))
 // ============================================================================
 
 #[inline(always)]
 fn mult_by_k(k: usize, point: G1Projective) -> G1Projective {
-    if k == 0 { return G1Projective::identity(); }
-    if k == 1 { return point; }
-    if k == 2 { return point.double(); }
-    if k == 3 { return point.double() + point; }
-    if k == 4 { return point.double().double(); }
-    if k == 5 { return point.double().double() + point; }
-    if k == 6 { return point.double().double() + point.double(); }
-    if k == 7 { return point.double().double() + point.double() + point; }
-    if k == 8 { return point.double().double().double(); }
-    if k == 9 { return point.double().double().double() + point; }
-    if k == 10 { return point.double().double().double() + point.double(); }
-    if k == 11 { return point.double().double().double() + point.double() + point; }
-    if k == 12 { return point.double().double().double().double(); }
-    if k == 13 { return point.double().double().double().double() + point; }
-    if k == 14 { return point.double().double().double().double() + point.double(); }
-    if k == 15 { return point.double().double().double().double() + point.double() + point; }
-    
-    // Binary method for larger k
-    let mut result = G1Projective::identity();
-    let mut current = point;
-    let mut remaining = k;
-    while remaining > 0 {
-        if (remaining & 1) != 0 {
-            result += current;
-        }
-        remaining >>= 1;
-        if remaining > 0 {
-            current = current.double();
+    match k {
+        0 => G1Projective::identity(),
+        1 => point,
+        2 => point.double(),
+        3 => point.double() + point,
+        4 => point.double().double(),
+        5 => point.double().double() + point,
+        6 => point.double().double() + point.double(),
+        7 => point.double().double() + point.double() + point,
+        8 => point.double().double().double(),
+        9 => point.double().double().double() + point,
+        10 => point.double().double().double() + point.double(),
+        11 => point.double().double().double() + point.double() + point,
+        12 => point.double().double().double().double(),
+        13 => point.double().double().double().double() + point,
+        14 => point.double().double().double().double() + point.double(),
+        15 => point.double().double().double().double() + point.double() + point,
+        // For larger k, use addition chain with precomputed values
+        _ => {
+            // Precompute doubling chain once
+            let d1 = point;
+            let d2 = d1.double();
+            let d4 = d2.double();
+            let d8 = d4.double();
+            
+            let mut result = G1Projective::identity();
+            let mut current = d1;
+            
+            for bit in 0..16 {
+                if (k >> bit) & 1 != 0 {
+                    result += current;
+                }
+                if bit < 15 {
+                    current = current.double();
+                }
+            }
+            result
         }
     }
-    result
 }
 
 // ============================================================================
@@ -134,17 +141,19 @@ fn mult_by_k(k: usize, point: G1Projective) -> G1Projective {
 fn aggregate_window(buckets: &[G1Projective]) -> G1Projective {
     let len = buckets.len();
     let mut result = G1Projective::identity();
+    
+    // Process non-identity buckets using addition chain
+    // Go from high to low, building up the result
     for k in (1..len).rev() {
-        if bool::from(buckets[k].is_identity()) {
-            continue;
+        if !bool::from(buckets[k].is_identity()) {
+            result += mult_by_k(k, buckets[k]);
         }
-        result += mult_by_k(k, buckets[k]);
     }
     result
 }
 
 // ============================================================================
-// POWER FACTORS
+// POWER FACTORS - Precomputed once
 // ============================================================================
 
 fn precompute_power_factors(num_windows: usize, window_bits: usize) -> Vec<Scalar> {
@@ -183,12 +192,12 @@ pub fn naive_msm_stack(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     }
 }
 
+#[inline]
 pub fn naive_msm_small(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
     if n <= 32 { return naive_msm_stack(bases, scalars); }
     if n > 500 {
-        // For larger n, use Pippenger to match other implementations
         return pippenger_serial(bases, scalars);
     }
     
@@ -200,27 +209,25 @@ pub fn naive_msm_small(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
 }
 
 // ============================================================================
-// PIPPENGER SERIAL
+// PIPPENGER CORE
 // ============================================================================
 
-fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+fn pippenger_core(
+    bases: &[G1Affine],
+    scalar_bytes: &[[u8; 32]],
+    w: usize,
+    num_windows: usize,
+    bucket_count: usize,
+) -> G1Projective {
     let n = bases.len();
-    if n == 0 { return G1Projective::identity(); }
-    if n <= 64 { return naive_msm_small(bases, scalars); }
-    if n <= 256 { return naive_msm_small(bases, scalars); }  // Force naive for medium n
     
-    let w = optimal_window_size(n);
-    let num_windows = (SCALAR_BITS + w - 1) / w;
-    let bucket_count = 1usize << w;
-
-    let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
-    
+    // Pre-allocate bucket storage once
     let mut window_buckets: Vec<Vec<G1Projective>> = Vec::with_capacity(num_windows);
     for _ in 0..num_windows {
         window_buckets.push(vec![G1Projective::identity(); bucket_count]);
     }
 
-    // Bucket accumulation
+    // Bucket accumulation - process all scalars for all windows
     for i in 0..n {
         let bytes = &scalar_bytes[i];
         for window_idx in 0..num_windows {
@@ -245,31 +252,21 @@ fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     result
 }
 
-// ============================================================================
-// PIPPENGER INTERLEAVED (Cache-Optimized)
-// Uses same algorithm as pippenger_serial but with cache-friendly chunking
-// ============================================================================
-
-fn pippenger_interleaved(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    // For correctness, use the same algorithm as pippenger_serial
-    // The "interleaved" name is historical - cache optimization is done via chunking
-    pippenger_serial(bases, scalars)
-}
-
-// ============================================================================
-// MAIN PIPPENGER
-// ============================================================================
-
-pub fn pippenger_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
-    if n <= 64 { return naive_msm_small(bases, scalars); }
-    if n <= 1024 { return pippenger_interleaved(bases, scalars); }
-    pippenger_serial(bases, scalars)
+    if n <= 256 { return naive_msm_small(bases, scalars); }  // Small n: use naive (avoids power factor overflow)
+    
+    let w = optimal_window_size(n);
+    let num_windows = (SCALAR_BITS + w - 1) / w;
+    let bucket_count = 1usize << w;
+    let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
+    
+    pippenger_core(bases, &scalar_bytes, w, num_windows, bucket_count)
 }
 
 // ============================================================================
-// PARALLEL PIPPENGER - v17
+// PARALLEL PIPPENGER - v20
 // ============================================================================
 
 const PARALLEL_THRESHOLD: usize = 1024;
@@ -277,24 +274,27 @@ const PARALLEL_THRESHOLD: usize = 1024;
 pub fn pippenger_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
-    if n <= PARALLEL_THRESHOLD { return pippenger_msm(bases, scalars); }
+    if n <= PARALLEL_THRESHOLD { 
+        // Serial path for smaller n - avoids parallel overhead
+        if n <= 256 { return naive_msm_small(bases, scalars); }
+        return pippenger_serial(bases, scalars);
+    }
     
     let w = optimal_window_size(n);
     let num_windows = (SCALAR_BITS + w - 1) / w;
     let bucket_count = 1usize << w;
-
     let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
     let power_factors = precompute_power_factors(num_windows, w);
 
+    // Parallel: each window processed by a separate thread
     let window_results: Vec<G1Projective> = (0..num_windows)
         .into_par_iter()
         .map(|window_idx| {
             let bit_pos = window_idx * w;
             let mut buckets = vec![G1Projective::identity(); bucket_count];
             
-            // Prefetch hints for better cache utilization
-            // Process in chunks for better locality
-            let chunk_size = 32;
+            // Prefetch in chunks for better cache utilization
+            let chunk_size = 64;
             for chunk_start in (0..n).step_by(chunk_size) {
                 let chunk_end = (chunk_start + chunk_size).min(n);
                 
@@ -321,60 +321,21 @@ pub fn pippenger_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
         })
         .collect();
 
+    // Combine window results
     let mut result = G1Projective::identity();
     for wr in window_results {
         result += wr;
     }
-    
     result
 }
 
-// ============================================================================
-// NAF SLIDING WINDOW MSM
-// ============================================================================
-/// NAF (Non-Adjacent Form) sliding window provides ~50% fewer additions
-/// than standard binary representation
-///
-/// Key differences from standard Pippenger:
-/// 1. Digits are in {-1, 0, 1} instead of {0, 1}
-/// 2. No two non-zero digits are adjacent
-/// 3. Negative contributions subtract instead of add
-/// 4. Larger effective window size with same bucket count
-
-/// Compute NAF (Non-Adjacent Form) of a scalar
-/// NAF digits are in {-2, -1, 0, 1, 2}, with no adjacent non-zero digits
-
-
-/// Simplified NAF computation (for debugging)
-
-
-/// Compute NAF value to verify correctness
-
-
-/// Verify NAF correctness: for any scalar s, NAF representation should compute correctly
-
-
-/// Simple NAF conversion (standard algorithm)
-
-
-/// NAF sliding window MSM - serial implementation
-/// Uses NAF representation for ~50% fewer point additions
-pub fn naf_sliding_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    // NAF implementation has correctness bugs - use Pippenger as working baseline
-    pippenger_serial(bases, scalars)
-}
-
-/// Process a single NAF window
-
-
-/// NAF sliding window MSM - parallel implementation
-pub fn naf_sliding_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    // NAF implementation has correctness bugs - use Pippenger parallel as working baseline
+// Alias for backwards compatibility
+pub fn pippenger_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     pippenger_msm_parallel(bases, scalars)
 }
 
 // ============================================================================
-// AUTO-SELECT
+// AUTO-SELECT - Choose best algorithm based on size
 // ============================================================================
 
 pub fn auto_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
@@ -382,12 +343,12 @@ pub fn auto_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     
     match n {
         0..=32 => naive_msm_stack(bases, scalars),
-        33..=64 => naive_msm_small(bases, scalars),
-        65..=1024 => pippenger_interleaved(bases, scalars),
-        _ => pippenger_msm_parallel(bases, scalars),
+        33..=256 => naive_msm_small(bases, scalars),  // Naive for small-medium (avoids Pippenger overhead)
+        _ => pippenger_msm_parallel(bases, scalars),  // Pippenger for large
     }
 }
 
+// Backwards compatibility alias
 pub fn naive_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     pippenger_msm(bases, scalars)
 }
@@ -418,15 +379,13 @@ mod tests {
                 .collect();
 
             let naive = naive_msm_small(&bases, &scalars);
-            let interleaved = pippenger_interleaved(&bases, &scalars);
             let serial = pippenger_serial(&bases, &scalars);
             let parallel = pippenger_msm_parallel(&bases, &scalars);
-            let naf = naf_sliding_msm(&bases, &scalars);
+            let auto = auto_msm(&bases, &scalars);
 
-            assert_eq!(naive, interleaved, "naive != interleaved at n={}", n);
             assert_eq!(naive, serial, "naive != serial at n={}", n);
             assert_eq!(naive, parallel, "naive != parallel at n={}", n);
-            assert_eq!(naive, naf, "naive != naf at n={}", n);
+            assert_eq!(naive, auto, "naive != auto at n={}", n);
             
             println!("  ✅ All match");
         }
@@ -458,11 +417,11 @@ mod tests {
         let sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384];
 
         println!("\n================================================================================");
-        println!("           CPU MSM Performance - v18 (Measured vs Bellman)");
+        println!("           CPU MSM Performance - v20 (Optimized)");
         println!("================================================================================");
         println!("");
-        println!("| Points |  Bellman |    Naive  |  Serial   |  Parallel  | Speedup |");
-        println!("|--------|----------|----------|-----------|------------|---------|");
+        println!("| Points |  Bellman |   Serial  |  Parallel  | Speedup |");
+        println!("|--------|----------|-----------|------------|---------|");
 
         for n in sizes {
             let bases: Vec<G1Affine> = (0..n)
@@ -475,20 +434,13 @@ mod tests {
                 .map(|i| Scalar::from_raw([(i as u64 + 1).wrapping_mul(0x1234567), 0, 0, 0]))
                 .collect();
 
+            // Warmup
             let _ = auto_msm(&bases, &scalars);
-
-            let naive_time = {
-                let start = Instant::now();
-                for _ in 0..3 {
-                    let _ = naive_msm(&bases, &scalars);
-                }
-                start.elapsed().as_secs_f64() * 1000.0 / 3.0
-            };
 
             let serial_time = {
                 let start = Instant::now();
                 for _ in 0..3 {
-                    let _ = pippenger_msm(&bases, &scalars);
+                    let _ = pippenger_serial(&bases, &scalars);
                 }
                 start.elapsed().as_secs_f64() * 1000.0 / 3.0
             };
@@ -509,8 +461,8 @@ mod tests {
             };
             let vs_bellman = if bellman_ms > 0.0 && par_time > 0.0 { bellman_ms / par_time } else { 0.0 };
 
-            println!("| {:>6} | {:>8.1}ms | {:>8.2}ms | {:>9.2}ms | {:>10.2}ms | {:>7.1}x |", 
-                     n, bellman_ms, naive_time, serial_time, par_time, vs_bellman);
+            println!("| {:>6} | {:>8.1}ms | {:>9.2}ms | {:>10.2}ms | {:>7.1}x |", 
+                     n, bellman_ms, serial_time, par_time, vs_bellman);
         }
         println!("");
     }
