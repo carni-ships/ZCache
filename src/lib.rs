@@ -1,11 +1,13 @@
-//! CPU MSM Implementation - v27 (Bellman-inspired)
+//! CPU MSM Implementation - v30 (Parallel Window)
 //!
 //! Optimizations inspired by Bellman's multiexp implementation:
 //! 1. ln(n) Chunk Size - Variable window size based on input size
-//! 2. Summation by Parts - O(2^c) instead of O(c * 2^c) for reduction
-//! 3. Density Tracking - Skip windows where scalar has no non-zero bits
+//! 2. Summation by Parts - O(2^c) reduction
+//! 3. Density Tracking - Skip empty windows
+//! 4. Window-Parallel - Process each chunk in parallel using rayon
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
+use rayon::prelude::*;
 
 const SCALAR_BITS: usize = 255;
 const NAIVE_THRESHOLD: usize = 64;
@@ -24,10 +26,8 @@ fn extract_window_bits(bytes: &[u8; 32], start_bit: usize, num_bits: usize) -> u
     while bits_extracted < num_bits && byte_idx < 32 {
         let bits_in_byte = 8 - (bit_pos % 8);
         let bits_to_take = bits_in_byte.min(num_bits - bits_extracted);
-        
         let mask = (1usize << bits_to_take) - 1;
         result |= ((bytes[byte_idx] >> (bit_pos % 8)) as usize & mask) << bits_extracted;
-        
         bit_pos += bits_to_take;
         bits_extracted += bits_to_take;
         byte_idx += 1;
@@ -37,7 +37,7 @@ fn extract_window_bits(bytes: &[u8; 32], start_bit: usize, num_bits: usize) -> u
 }
 
 // ============================================================================
-// Bellman-style multiexp (serial, correct)
+// Helper Functions
 // ============================================================================
 
 fn optimal_chunk_size(n: usize) -> usize {
@@ -57,6 +57,10 @@ fn has_nonzero_bits(bytes: &[u8; 32], start_bit: usize, num_bits: usize) -> bool
     }
     false
 }
+
+// ============================================================================
+// Bellman-style multiexp (SERIAL)
+// ============================================================================
 
 /// Bellman-style multiexp using ln(n) chunks and summation by parts
 pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
@@ -114,6 +118,67 @@ pub fn bellman_style_multiexp(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
 }
 
 // ============================================================================
+// Bellman-style multiexp (PARALLEL over windows)
+// ============================================================================
+
+/// Parallel version: process each window in parallel, then combine
+pub fn bellman_style_multiexp_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    let n = bases.len();
+    if n == 0 { return G1Projective::identity(); }
+    if n <= NAIVE_THRESHOLD { return naive_msm_stack(bases, scalars); }
+    
+    let c = optimal_chunk_size(n);
+    let num_chunks = (SCALAR_BITS + c - 1) / c;
+    let bucket_count = 1usize << c;
+    
+    let bases_vec = bases.to_vec();
+    let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
+    
+    // Parallelize over chunks
+    let chunk_results: Vec<G1Projective> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+        let bit_pos = chunk_idx * c;
+        
+        // Skip empty windows
+        let mut has_nonzero = false;
+        for bytes in &scalar_bytes {
+            if has_nonzero_bits(bytes, bit_pos, c) {
+                has_nonzero = true;
+                break;
+            }
+        }
+        if !has_nonzero { return G1Projective::identity(); }
+        
+        let mut buckets: Vec<G1Projective> = vec![G1Projective::identity(); bucket_count];
+        
+        for i in 0..n {
+            let k = extract_window_bits(&scalar_bytes[i], bit_pos, c);
+            if k > 0 {
+                buckets[k] += bases_vec[i];
+            }
+        }
+        
+        // Summation by parts
+        let mut chunk_sum = G1Projective::identity();
+        for bucket in buckets.into_iter().rev() {
+            chunk_sum += bucket;
+        }
+        
+        chunk_sum
+    }).collect();
+    
+    // Combine chunks: double c times for each chunk position
+    let mut result = G1Projective::identity();
+    for chunk_idx in 0..num_chunks {
+        for _ in 0..c {
+            result = result.double();
+        }
+        result += chunk_results[chunk_idx];
+    }
+    
+    result
+}
+
+// ============================================================================
 // Naive MSM
 // ============================================================================
 
@@ -134,26 +199,17 @@ pub fn naive_msm_small(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     naive_msm_stack(bases, scalars)
 }
 
-// ============================================================================
-// Pippenger Serial - same as bellman_style
-// ============================================================================
-// Pippenger Serial - alias to bellman_style
-// ============================================================================
-
+// Aliases for compatibility
 pub fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     bellman_style_multiexp(bases, scalars)
 }
-
-// ============================================================================
-// Pippenger Parallel (window-first parallelization)
-// ============================================================================
 
 pub fn pippenger_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     bellman_style_multiexp(bases, scalars)
 }
 
 pub fn pippenger_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    pippenger_msm_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
 }
 
 // ============================================================================
@@ -164,28 +220,30 @@ pub fn auto_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
     
+    // Use parallel for large n, serial for small-medium
     if n <= NAIVE_THRESHOLD {
         naive_msm_stack(bases, scalars)
+    } else if n <= 2048 {
+        bellman_style_multiexp(bases, scalars)  // Serial for n <= 2048
     } else {
-        // Use Bellman-style for correctness (ln(n) chunks, summation by parts)
-        bellman_style_multiexp(bases, scalars)
+        bellman_style_multiexp_parallel(bases, scalars)  // Parallel for n > 2048
     }
 }
 
 pub fn sliding_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    auto_msm(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
 }
 
 pub fn sliding_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    auto_msm(bases, scalars)
-}
-
-pub fn strauss_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    pippenger_msm_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
 }
 
 pub fn strauss_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    pippenger_msm_parallel(bases, scalars)
+    bellman_style_multiexp(bases, scalars)
+}
+
+pub fn strauss_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    bellman_style_multiexp(bases, scalars)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,8 +252,7 @@ pub enum Algorithm { Naive, Strauss, Pippenger }
 pub fn msm_with_algorithm(bases: &[G1Affine], scalars: &[Scalar], algorithm: Algorithm) -> G1Projective {
     match algorithm {
         Algorithm::Naive => naive_msm_stack(bases, scalars),
-        Algorithm::Strauss => strauss_msm_parallel(bases, scalars),
-        Algorithm::Pippenger => pippenger_msm_parallel(bases, scalars),
+        Algorithm::Strauss | Algorithm::Pippenger => bellman_style_multiexp(bases, scalars),
     }
 }
 
@@ -225,23 +282,19 @@ mod tests {
     }
     
     #[test]
-    fn test_performance() {
-        use std::time::Instant;
-        
+    fn test_correctness() {
         let g = G1Affine::generator();
         
-        println!("\n=== MSM Performance ===");
-        println!("|  n   |  Naive  | Bellman | Pippenger |");
-        
-        for n in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384] {
+        for n in [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384] {
             let bases: Vec<G1Affine> = (0..n).map(|_| g).collect();
             let scalars: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
             
-            let naive_time = { let start = Instant::now(); for _ in 0..3 { let _ = naive_msm_stack(&bases, &scalars); } start.elapsed().as_secs_f64() * 1000.0 / 3.0 };
-            let bellman_time = { let start = Instant::now(); for _ in 0..3 { let _ = bellman_style_multiexp(&bases, &scalars); } start.elapsed().as_secs_f64() * 1000.0 / 3.0 };
-            let pippenger_time = { let start = Instant::now(); for _ in 0..3 { let _ = pippenger_msm_parallel(&bases, &scalars); } start.elapsed().as_secs_f64() * 1000.0 / 3.0 };
+            let naive_result = naive_msm_stack(&bases, &scalars);
+            let bellman_result = bellman_style_multiexp(&bases, &scalars);
+            let auto_result = auto_msm(&bases, &scalars);
             
-            println!("| {:5} | {:6.1}ms | {:7.1}ms | {:9.1}ms |", n, naive_time, bellman_time, pippenger_time);
+            assert_eq!(naive_result, bellman_result, "n={}: bellman mismatch", n);
+            assert_eq!(naive_result, auto_result, "n={}: auto mismatch", n);
         }
     }
 }
