@@ -2,96 +2,90 @@
 
 Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in pure Rust.
 
-## Current Performance vs Bellman (Real Benchmark)
+## Performance vs Bellman (Real Benchmark)
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║          Bellman vs CPU-MSM-Optimized (v41)                           ║
+║          Bellman vs CPU-MSM-Optimized (v45)                           ║
+║          Point-Parallel MSM with Rayon                               ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 ┌─────────┬────────────────┬────────────────┬────────────┬─────────────┐
 │   n     │    Bellman     │   Optimized    │  Speedup   │  Winner     │
 ├─────────┼────────────────┼────────────────┼────────────┼─────────────┤
-│      64 │           0.53ms │          14.92ms │       0.04x │        BNM │
-│     128 │           0.54ms │           1.85ms │       0.29x │        BNM │
-│     256 │           0.85ms │           3.21ms │       0.26x │        BNM │
-│     512 │           1.15ms │           5.60ms │       0.21x │        BNM │
-│    1024 │           1.66ms │           6.15ms │       0.27x │        BNM │
-│    4096 │           4.41ms │          19.70ms │       0.22x │        BNM │
-│   16384 │          15.11ms │          44.43ms │       0.34x │        BNM │
-│   65536 │          61.86ms │         187.87ms │       0.33x │        BNM │
-│ 1048576 │         844.66ms │         725.81ms │       1.16x │  **OPT**   │
+│      64 │           0.61ms │          14.85ms │       0.04x │       BNM │
+│     128 │           0.59ms │           2.83ms │       0.21x │       BNM │
+│     256 │           0.84ms │           2.95ms │       0.28x │       BNM │
+│     512 │           1.38ms │           4.18ms │       0.33x │       BNM │
+│    1024 │           1.88ms │           4.44ms │       0.42x │       BNM │
+│    2048 │           3.44ms │           6.83ms │       0.50x │       BNM │
+│    4096 │           4.89ms │           7.73ms │       0.63x │       BNM │
+│    8192 │           9.29ms │          14.58ms │       0.64x │       BNM │
+│   16384 │          16.35ms │          14.75ms │       1.11x │  **OPT**  │
+│   32768 │          33.10ms │          19.04ms │       1.74x │  **OPT**  │
+│   65536 │          64.35ms │          26.71ms │       2.41x │  **OPT**  │
+│  131072 │         114.70ms │          44.59ms │       2.57x │  **OPT**  │
+│  262144 │         228.77ms │          72.12ms │       3.17x │  **OPT**  │
+│  524288 │         451.62ms │         153.73ms │       2.94x │  **OPT**  │
+│ 1048576 │         859.53ms │         261.59ms │       3.29x │  **OPT**  │
 └─────────┴────────────────┴────────────────┴────────────┴─────────────┘
 ```
 
-## Analysis: Why We Lose
+## Algorithm Breakdown
 
-### Bellman's Advantage
+| n | Naive | Bellman | Ours | Winner |
+|---|-------|---------|------|--------|
+| 64 | 14.77ms | 0.61ms | 14.85ms | Bellman |
+| 256 | 59.80ms | 1.05ms | 3.10ms | Bellman |
+| 1024 | 244.12ms | 1.71ms | 4.35ms | Bellman |
+| 4096 | 948.49ms | 4.44ms | 7.58ms | Bellman |
+| 16384 | 3815.53ms | 16.62ms | 14.38ms | **Ours** |
 
-| Factor | Bellman | Our Implementation |
-|--------|---------|-------------------|
-| Cores | 8-core parallel | Serial (only parallel at n≥65536) |
-| Scheduling | Work-stealing | Rayon thread pool |
-| Memory | Batched, cache-friendly | Sequential |
+## Key Insights
 
-### Our Serial Algorithm
+### Why Bellman Wins at Medium Sizes (n < 16384)
 
-The bucket method (ln(n) chunks, summation by parts) is correct and 10-20x faster than naive for medium n:
-- n=64: naive=14.6ms, bucket=14.5ms (same, overhead dominates)
-- n=256: naive=58.4ms, bucket=3.3ms (17x faster!)
-- n=1024: naive=236ms, bucket=6.2ms (38x faster!)
+- **8-core parallelization** kicks in immediately (even for n=64)
+- **Work-stealing thread pool** - efficient load balancing
+- **Point-parallelization** - parallelizes over points, not windows
 
-But Bellman's **8-core parallelization** gives them 4-25x speedup over our serial code.
+### Why We Win at Large Sizes (n >= 16384)
 
-### What We Tried
+- **Better point-parallelization** - each thread processes ALL windows for its points
+- **Thread-local buckets** - no mutex contention
+- **Efficient bucket reduction** - summation by parts: O(2^c) instead of O(c × 2^c)
 
-1. **Window-parallelization** - Parallel over windows (19-51 tasks) - too few for 8 cores
-2. **Point-parallelization** - Parallel over points - memory explosion (2.5M buckets)
-3. **Window-sum reduction** - Thread returns one value per window - still too slow
-4. **Hybrid (serial + parallel for n≥65536)** - Parallel only helps at 1M+ points
+### Parallelization Strategy
 
-### Why Parallelization Didn't Help
-
-The fundamental issue: each parallel task still does O(n) work, and the thread coordination overhead (Vec allocation, thread spawning, result combining) dominates at small-medium n.
-
-## Algorithm Implementation
-
-### Serial Bellman-style MSM (ln(n) chunks)
-
+Our point-parallel approach:
 ```
-serial_msm(bases, scalars):
-├─ c = ceil(ln(n)) chunk size (3-15 based on n)
-├─ num_chunks = 255/c
-├─ For each chunk:
-│  ├─ Allocate 2^c buckets
-│  ├─ Accumulate bases[i] into bucket[k]
-│  └─ Summation by parts: sum(k * bucket[k])
-└─ Combine: MSB to LSB with doubling
+Thread 0: points[0..n/threads), ALL windows → returns num_windows partial sums
+Thread 1: points[n/threads..2n/threads), ALL windows → returns num_windows partial sums
+...
+Thread N-1: points[(N-1)n/threads..n), ALL windows → returns num_windows partial sums
+
+Combine: sum thread results per window, then windows MSB to LSB
 ```
 
-### Parallel MSM (hybrid, for n≥65536)
+Each thread has its own buckets (no race conditions), and returns ONE value per window.
 
-```
-parallel_msm(bases, scalars):
-├─ Split points across threads (each thread = points/n_threads)
-├─ Each thread processes ALL windows sequentially:
-│  ├─ Allocate 2^c buckets (reuse for each window)
-│  ├─ Accumulate thread's points into buckets
-│  └─ Reduce to one value per window
-├─ Return: num_chunks values (one per window)
-└─ Combine: just num_chunks additions + MSB-to-LSB doubling
-```
+## Implementation
 
-## To Beat Bellman
+### Key Components
 
-**Priority order:**
+1. **Bit Extraction**: Extract k-bit chunks from 32-byte scalars
+2. **Bucket Accumulation**: bases[i] → buckets[k] where k = bits_w(scalars[i])
+3. **Summation by Parts**: sum(k × bucket[k]) = Σ Σ bucket[j] for j >= k
+4. **Window Combination**: Process windows MSB to LSB with doubling
 
-1. **SIMD bit extraction** - AVX2 to extract bits from 8 scalars simultaneously
-2. **Better parallelization** - Process points in cache-friendly batches
-3. **Atomic bucket accumulation** - Shared buckets with atomics (avoids per-thread bucket allocation)
-4. **Assembly intrinsics** - x86_64 optimized point operations
+### Adaptive Window Size
 
-The serial implementation has reached its limit. Further improvements require **proper SIMD + parallelization working together**.
+| n Range | Window Size (w) | Bucket Count (2^w) |
+|---------|----------------|-------------------|
+| n <= 256 | 4 | 16 |
+| n <= 1024 | 5 | 32 |
+| n <= 4096 | 6 | 64 |
+| n > 4096 | 7 | 128 |
 
 ## Running
 
@@ -99,23 +93,37 @@ The serial implementation has reached its limit. Further improvements require **
 # Compare against real Bellman
 cargo run --release --example bellman_compare
 
-# Run tests
+# Run tests (verifies correctness against naive)
 cargo test --release
+
+# Run benchmarks
+cargo run --release --example benchmark
 ```
 
 ## Files
 
-- `src/lib.rs` - Main implementation (261 lines)
+- `src/lib.rs` - Main implementation (220 lines)
 - `examples/bellman_compare.rs` - Real Bellman comparison
-- `Cargo.toml` - Dependencies
+- `examples/benchmark.rs` - Benchmark comparison
+- `Cargo.toml` - Dependencies (bls12_381, bellman, rayon)
+
+## Performance Analysis
+
+| Region | Algorithm | Why |
+|--------|-----------|-----|
+| n <= 64 | Naive | Bucket overhead not worth it |
+| 64 < n < 16384 | Bellman (parallel) | Their 8-core parallelization effective |
+| n >= 16384 | Ours (parallel) | Our point-parallelization scales better |
 
 ## History
 
-- v41: Hybrid serial/parallel (parallel only at n≥65536)
+- v45: Point-parallel with thread-local buckets, beats Bellman at n >= 16384
+- v43-44: SIMD attempts (not fully implemented)
+- v42: Point-parallel with window-sum reduction
+- v41: Hybrid serial/parallel
 - v40: Point-parallel with window-sum reduction
-- v39: Clean serial implementation
-- v38: Summation by parts bug fixed
-- v37: Lessons learned on parallelization attempts
+- v39: Honest assessment - serial loses to Bellman
+- v38: Incorrect "3.5x faster" (measurement error)
 
 ## License
 
