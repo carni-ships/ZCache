@@ -2,110 +2,95 @@
 
 Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in pure Rust.
 
-## Performance Results vs Bellman (Real Benchmark)
+## Current Performance vs Bellman (Real Benchmark)
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║          Bellman vs CPU-MSM-Optimized Benchmark (Real)                  ║
+║          Bellman vs CPU-MSM-Optimized (Current State)                    ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 ┌─────────┬────────────────┬────────────────┬────────────┬─────────────┐
 │   n     │    Bellman     │   Optimized    │  Speedup   │  Winner     │
 ├─────────┼────────────────┼────────────────┼────────────┼─────────────┤
-│     128 │           0.60ms│           0.17ms│       3.5x│         OPT│
-│     256 │           0.90ms│           0.28ms│       3.2x│         OPT│
-│     512 │           1.29ms│           0.45ms│       2.9x│         OPT│
-│    1024 │           1.62ms│           0.74ms│       2.2x│         OPT│
-│    2048 │           3.23ms│           1.46ms│       2.2x│         OPT│
-│    4096 │           5.06ms│           3.07ms│       1.6x│         OPT│
-│    8192 │           9.63ms│           6.29ms│       1.5x│         OPT│
-│   16384 │          15.43ms│          13.15ms│       1.2x│         OPT│
-│   32768 │          31.75ms│          27.08ms│       1.2x│         OPT│
-│   65536 │          60.05ms│          54.77ms│       1.1x│         OPT│
-│  131072 │         111.41ms│         110.58ms│       1.0x│         OPT│
-│  262144 │         228.38ms│         219.91ms│       1.0x│         OPT│
-│  524288 │         498.12ms│         438.92ms│       1.1x│         OPT│
-│ 1048576 │         862.25ms│         873.55ms│       1.0x│         OPT│
+│     128 │           0.64ms│           1.98ms│       0.32x│        BNM  │
+│     256 │           0.85ms│           3.39ms│       0.25x│        BNM  │
+│     512 │           1.39ms│           5.68ms│       0.24x│        BNM  │
+│    1024 │           1.94ms│           6.23ms│       0.31x│        BNM  │
+│    4096 │           4.96ms│          20.50ms│       0.24x│        BNM  │
+│   16384 │          16.54ms│          45.76ms│       0.36x│        BNM  │
+│   65536 │          61.51ms│         167.94ms│       0.37x│        BNM  │
+│ 1048576 │         875.75ms│        1422.14ms│       0.62x│        BNM  │
 └─────────┴────────────────┴────────────────┴────────────┴─────────────┘
 ```
 
-## Key Results
+## Analysis: Why We Lose
 
-| Range | Speedup vs Bellman |
-|-------|-------------------|
-| n = 128 - 512 | **2.9x - 3.5x faster** |
-| n = 1024 - 2048 | **2.2x faster** |
-| n = 4096 - 32768 | **1.2x - 1.6x faster** |
-| n ≥ 65536 | **1.0x - 1.1x faster** |
+| Factor | Bellman | Our Implementation |
+|--------|---------|-------------------|
+| Parallelization | 8-core Worker pool | Serial (single-threaded) |
+| Chunk handling | Point-parallel | Serial per-window |
+| Memory access | Batched, cache-friendly | Sequential |
 
-### At Scale (2^16 = 65,536 points)
+**Key insight**: Our serial implementation loses to Bellman's parallel implementation at all sizes.
 
-| Implementation | Time | 
-|----------------|------|
-| Bellman (parallel) | 60.05ms |
-| Ours (serial) | 54.77ms |
-| **Speedup** | **1.1x faster** |
+## Implementation
 
-## Algorithm Design
-
-### Serial Implementation (ln(n) Chunks)
+### Algorithm: ln(n) Chunks + Summation by Parts
 
 ```
-bellman_style_multiexp(bases, scalars):
-├─ c = ceil(ln(n)) chunk size (3-15 based on n)
-├─ num_chunks = 255/c (85 down to 17 windows)
-├─ For each chunk (serial):
-│  ├─ Allocate 2^c buckets
+optimized_msm(bases, scalars):
+├─ c = ceil(ln(n)) chunk size
+├─ num_chunks = 255/c
+├─ bucket_count = 2^c
+├─ For each chunk:
 │  ├─ Accumulate bases[i] into bucket[k]
-│  └─ Weighted sum: sum(k * bucket[k])
-└─ Combine: Process from MSB to LSB (double c times, then add)
+│  └─ Summation by parts: sum(k * bucket[k])
+└─ Combine: MSB to LSB with doubling
 
-Time: O(n × c + num_chunks × 2^c)
+Time: O(n × num_chunks) for accumulation + O(num_chunks × 2^c) for reduction
 ```
 
-## Optimizations Applied
+### Summation by Parts Formula
 
-1. **ln(n) Chunk Size**: Optimal bucket count vs fixed windows
-2. **Direct Weighted Sum**: O(2^c) instead of O(c × 2^c)  
-3. **MSB-to-LSB Combination**: Correct scaling for chunk accumulation
-4. **Bit Masking**: Prevent out-of-bounds bucket access
+```
+sum_{k=1}^{m} k * bucket[k] = sum_{k=1}^{m} running_sum[k]
 
-## Why We Win
+where running_sum[k] = bucket[k] + bucket[k+1] + ... + bucket[m]
 
-1. **Pure Serial Efficiency**: No parallelization overhead (thread coordination, work stealing)
-2. **Memory Locality**: Sequential access pattern for better cache utilization
-3. **Simpler Code**: Fewer branches and conditions
-4. **Bellman's Parallelization Tax**: Their multicore worker pool has overhead that doesn't pay off at these sizes
-
-## Benchmark Methodology
-
-Real benchmark using the actual `bellman` crate:
-```bash
-cargo run --release --example bellman_compare
+This is computed by iterating backward and accumulating:
+running_sum += bucket[k]
+result += running_sum
 ```
 
-- Generate sequential scalars for deterministic results
-- Run 5 iterations, take average
-- Warmup iterations ensure JIT-free measurement
+## To Improve: Add Proper Parallelization
 
-## Key Files
+Priority order:
+1. **Point-parallel with shared buckets** - Each thread processes a range of points, accumulate into shared bucket arrays
+2. **Window-batch parallelization** - Process 4-8 windows at a time in parallel
+3. **SIMD bit extraction** - Extract bits from multiple scalars simultaneously
 
-- `src/lib.rs` - Main MSM implementation (224 lines, pure serial)
-- `examples/bellman_compare.rs` - Real Bellman comparison benchmark
+## Files
+
+- `src/lib.rs` - Main implementation (160 lines)
+- `examples/bellman_compare.rs` - Real Bellman comparison
 - `Cargo.toml` - Dependencies (bls12_381, bellman, rayon)
 
-## Running Benchmarks
+## Running
 
 ```bash
-# Run Bellman comparison
+# Compare against real Bellman
 cargo run --release --example bellman_compare
 
 # Run tests
 cargo test --release
-
-# Run specific test with output
-cargo test --release test_correctness -- --nocapture
 ```
+
+## History
+
+- v39: Clean implementation, verified correctness
+- v38: Reported 3.5x speedup (later found to be measurement error)
+- v37: Lessons learned on parallelization attempts
+- v30-v35: Window-parallelization (didn't scale)
 
 ## License
 
