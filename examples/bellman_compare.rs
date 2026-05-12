@@ -5,7 +5,7 @@
 use std::time::Instant;
 use std::sync::Arc;
 use bls12_381::{G1Affine, G1Projective, Scalar};
-use cpu_msm_optimized::{auto_msm, bellman_style_multiexp, bellman_style_multiexp_parallel, naive_msm_stack};
+use cpu_msm_optimized::{auto_msm, bellman_style_multiexp, naive_msm_stack};
 
 use bellman::multiexp::{multiexp, FullDensity};
 use bellman::multicore::Worker;
@@ -15,7 +15,7 @@ fn main() {
     println!("║          Bellman vs CPU-MSM-Optimized Benchmark (REAL)                    ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝\n");
     
-    let sizes = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+    let sizes = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
     
     println!("┌─────────┬────────────────┬────────────────┬────────────┬─────────────┐");
     println!("│   n     │    Bellman     │   Optimized    │  Speedup   │  Winner     │");
