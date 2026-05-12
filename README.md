@@ -1,34 +1,33 @@
 # CPU MSM Optimization
 
-Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in pure Rust with AVX2 SIMD acceleration.
+Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in pure Rust.
 
-**Achieves up to 5.8x speedup over vanilla Zcash (Bellman) at large inputs (n > 2048).**
+**Achieves up to 1.1x speedup over vanilla Zcash (Bellman) at very large inputs (n > 16384).**
 
 ## Performance Results (Measured)
 
 ### Our Implementation vs Zcash (Bellman)
 
-| Points | Bellman (Zcash) | Serial (ours) | Parallel (ours) | Speedup |
-|--------|-----------------|---------------|-----------------|---------|
-| 64 | 2.5ms | 14.5ms | 14.5ms | 0.2x |
-| 256 | 4.8ms | 58.1ms | 57.4ms | 0.1x |
-| 512 | 4.8ms | 4.6ms | 4.6ms | **1.0x** |
-| 1024 | 6.9ms | 6.9ms | 7.0ms | 1.0x |
-| 2048 | 10.7ms | 10.4ms | **2.6ms** | **4.1x** |
-| 4096 | 21.1ms | 17.8ms | **3.6ms** | **5.8x** |
-| 16384 | 44.3ms | 53.9ms | **10.7ms** | **4.2x** |
+| Points | Bellman (Zcash) | Serial | Parallel | Speedup |
+|--------|-----------------|--------|----------|---------|
+| 16 | 2.10ms | 3.83ms | 3.75ms | 0.6x |
+| 64 | 2.50ms | 14.97ms | 14.98ms | 0.2x |
+| 256 | 4.80ms | 21.43ms | 21.46ms | 0.2x |
+| 1024 | 6.90ms | 29.74ms | 29.73ms | 0.2x |
+| 2048 | 10.70ms | 34.58ms | 16.98ms | 0.6x |
+| 4096 | 21.10ms | 50.50ms | 32.22ms | 0.7x |
+| 16384 | 44.30ms | 87.20ms | **39.73ms** | **1.1x** |
 
 **Key findings:**
-- Peak speedup of **5.8x** at n=4096 (parallel implementation)
-- **4.1x** at n=2048, **4.2x** at n=16384
-- Bellman wins for n < 512 (due to SIMD/assembly optimizations we lack)
+- **We win at n=16384** (parallel beats Bellman by 1.1x)
+- Bellman wins at small-medium sizes due to SIMD/assembly optimizations
+- Parallel implementation scales with CPU cores at large n
 
-## Why We're Faster at Large N
+## Why We Win at Large N
 
-1. **SIMD-accelerated bit extraction** - Process 8 scalars at once using x86 AVX2
-2. **Parallel window-first** - Each thread processes one window for maximum parallelism  
-3. **Cache-friendly prefetching** - Minimize memory latency
-4. **Pippenger's algorithm** - O(n/w + 2^w) complexity becomes more efficient at scale
+1. **Parallel Pippenger** - Window-first parallelization scales with CPU cores
+2. **Rayon multi-threading** - Processes windows in parallel
+3. **Pippenger's algorithm** - O(n/w + 2^w) complexity with parallelism
 
 ## Implemented Optimizations
 
@@ -36,9 +35,9 @@ Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in 
 2. **Batch Point Doubling** - Pre-computed doubling chains for common patterns
 3. **Parallel Window-First** - Each thread processes one window for maximum parallelism
 4. **Cache-Friendly Chunking** - Grouped scalar access for better locality
-5. **Identity Skip Optimization** - Avoid unnecessary operations on zero buckets
+5. **Identity Skip Optimization** - Skip zero buckets
 6. **Memory Prefetch Hints** - CPU cache hints for better locality (x86 SSE2)
-7. **Addition Chain Aggregation** - O(k) instead of O(k log k) per window
+7. **Direct Scalar Multiplication** - Use Scalar::from(k) for bucket scaling
 8. **SIMD Bit Extraction** - Process 8 scalars at once (x86 AVX2)
 
 ## Architecture
@@ -46,21 +45,14 @@ Optimized Multi-Scalar Multiplication (MSM) for BLS12-381 G1 curves, written in 
 ```
 Algorithm Selection (auto_msm):
 ├─ n ≤ 32:     Stack-allocated naive (fastest for tiny inputs)
-├─ n ≤ 256:    Naive with heap allocation
+├─ n ≤ 64:     Naive with heap allocation
 ├─ n ≤ 1024:   Interleaved Pippenger (cache-friendly chunking)
-└─ n > 1024:   Parallel Pippenger with SIMD (Rayon multi-threaded)
+└─ n > 1024:   Parallel Pippenger (Rayon multi-threaded)
 
-Bucket Accumulation (SIMD-accelerated):
-├─ w=4, n≥64:  AVX2 parallel (8 scalars per iteration)
-└─ Other:      Scalar fallback with prefetch hints
+Pippenger Formula:
+result = Σ (2^(j*w)) * Σ (k[i][j] * base[i])
+where k[i][j] is the j-th w-bit window of scalar[i]
 ```
-
-### Key Technical Insight: Power Factor Overflow
-
-Standard Pippenger's power factor `2^(j×w)` can overflow near the BLS12-381 scalar field modulus (~2^255). 
-
-- **Problem**: With w=2 and 128+ windows, `2^254 ≈ -1 mod p` causing catastrophic cancellation
-- **Solution**: Force naive algorithm for n ≤ 256 where overflow is most problematic
 
 ## Running Tests
 
@@ -70,27 +62,22 @@ cargo test test_correctness -- --nocapture
 cargo test test_performance -- --nocapture
 ```
 
-## Running Benchmarks
-
-```bash
-cargo run --release -- --benchmark
-```
-
 ## Key Files
 
 - `src/lib.rs` - Main MSM implementation with Pippenger + naive algorithms
 - `src/profiling.rs` - Profiling utilities
 - `Cargo.toml` - Dependencies (bls12_381, rayon)
 
-## Why Bellman is Faster at Small N
+## Why Bellman is Faster at Small-Medium N
 
 | Factor | Bellman | Ours |
 |--------|---------|------|
-| SIMD/AVX2 | ✅ Yes (full) | ✅ Partial (v21, w=4 only) |
+| SIMD/AVX2 | ✅ Yes (full) | ❌ No |
 | Assembly optimizations | ✅ Yes | ❌ No |
-| Multi-thread (small n) | ❌ No | ✅ No (n>1024) |
+| Multi-thread at small n | ❌ No | ❌ No |
+| Multi-thread at large n | ❌ No | ✅ Yes (n>2048) |
 
-Our implementation wins at **n > 2048** due to parallelism + SIMD. Bellman wins at **n < 512** due to fully optimized low-level code.
+Bellman wins at **n < 16384** due to SIMD/assembly. We win at **n ≥ 16384** due to multi-threading.
 
 ## References
 

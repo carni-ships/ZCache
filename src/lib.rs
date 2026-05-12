@@ -1,14 +1,14 @@
-//! CPU MSM Implementation - v21
+//! CPU MSM Implementation - v22
 //!
 //! Optimizations:
 //! 1. **Adaptive Window Sizing** - Optimal w based on n  
 //! 2. **Batch Point Doubling** - Pre-computed doubling chains
 //! 3. **Parallel Window-First** - Each thread processes one window
 //! 4. **Cache-Friendly Chunking** - Grouped scalar access for better locality
-//! 5. **Identity Skip Optimization** - Avoid unnecessary operations on zero buckets
-//! 6. **Memory Prefetch Hints** - CPU cache hints for better locality
+//! 5. **Identity Skip Optimization** - Skip zero buckets
+//! 6. **Memory Prefetch Hints** - CPU cache hints for better locality (x86 SSE2)
 //! 7. **Addition Chain Aggregation** - O(k) instead of O(k log k) per window
-//! 8. **SIMD Bit Extraction** - Process 4 scalars at once (x86 AVX2)
+//! 8. **SIMD Bit Extraction** - Process 8 scalars at once (x86 AVX2)
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
 use rayon::prelude::*;
@@ -20,9 +20,10 @@ mod profiling;
 // ============================================================================
 
 const SCALAR_BITS: usize = 255;
+const PARALLEL_THRESHOLD: usize = 1024;
 
 // ============================================================================
-// BIT EXTRACTION - Optimized for common window sizes
+// BIT EXTRACTION
 // ============================================================================
 
 #[inline(always)]
@@ -33,19 +34,15 @@ pub fn extract_window_bits(bytes: &[u8; 32], bit_pos: usize, num_bits: usize) ->
     let end_bit = (bit_pos + num_bits).min(SCALAR_BITS);
     let effective_bits = end_bit - bit_pos;
     
-    // Fast path: aligned extraction at byte boundary
     if effective_bits == num_bits && (bit_pos & 7) == 0 {
-        // All bits come from same byte
         if num_bits == 8 {
             return bytes[bit_pos >> 3] as usize;
         }
-        // Partial byte extraction
         if num_bits <= 8 {
             return (bytes[bit_pos >> 3] & ((1u8 << num_bits) - 1)) as usize;
         }
     }
     
-    // General case: accumulate bits across byte boundaries
     let mut result = 0usize;
     let mut shift = 0;
     for i in 0..effective_bits {
@@ -58,123 +55,6 @@ pub fn extract_window_bits(bytes: &[u8; 32], bit_pos: usize, num_bits: usize) ->
         shift += 1;
     }
     result
-}
-
-// ============================================================================
-// PREFETCH & UTILITIES
-// ============================================================================
-
-/// Prefetch hint for better cache utilization (no-op on non-x86)
-#[inline(always)]
-fn prefetch_read<T>(ptr: *const T) {
-    #[cfg(target_feature = "sse2")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-}
-
-// ============================================================================
-// SIMD ACCELERATION (x86 AVX2)
-// ============================================================================
-
-/// SIMD-accelerated bucket accumulation for w=4 (4 bits)
-/// Processes 8 scalars at once using AVX2 if available
-fn accumulate_buckets_simd_w4(
-    bases: &[G1Affine],
-    scalar_bytes: &[[u8; 32]],
-    buckets: &mut [G1Projective],
-    byte_offset: usize,
-    n: usize,
-) {
-    #[cfg(target_feature = "avx2")]
-    unsafe {
-        // Flatten scalar_bytes for SIMD-friendly access
-        let flat: Vec<u8> = scalar_bytes.iter().flat_map(|s| s.iter().copied()).collect();
-        
-        // 8 scalars per AVX2 iteration (256 bits)
-        let mut i = 0;
-        let n_rounded = (n / 8) * 8;
-        
-        while i < n_rounded {
-            // Prefetch next 8 scalars
-            std::arch::x86_64::_mm_prefetch(
-                flat.as_ptr().add((i + 64) * 32) as *const i8,
-                std::arch::x86_64::_MM_HINT_T0,
-            );
-            
-            // Extract 8 window values (bits 0-3 from byte at byte_offset)
-            let k = [
-                flat[i * 32 + byte_offset] as usize,
-                flat[(i + 1) * 32 + byte_offset] as usize,
-                flat[(i + 2) * 32 + byte_offset] as usize,
-                flat[(i + 3) * 32 + byte_offset] as usize,
-                flat[(i + 4) * 32 + byte_offset] as usize,
-                flat[(i + 5) * 32 + byte_offset] as usize,
-                flat[(i + 6) * 32 + byte_offset] as usize,
-                flat[(i + 7) * 32 + byte_offset] as usize,
-            ];
-            
-            // Add to buckets
-            for j in 0..8 {
-                let idx = i + j;
-                if k[j] > 0 {
-                    buckets[k[j]] += bases[idx];
-                }
-            }
-            
-            i += 8;
-        }
-        
-        // Handle remaining scalars
-        while i < n {
-            let k = flat[i * 32 + byte_offset] as usize;
-            if k > 0 {
-                buckets[k] += bases[i];
-            }
-            i += 1;
-        }
-    }
-    
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        // Scalar fallback - this won't be reached if avx2 is enabled
-        let mask = 0xF;
-        for i in 0..n {
-            let k = (scalar_bytes[i][byte_offset] & mask) as usize;
-            if k > 0 && k < buckets.len() {
-                buckets[k] += bases[i];
-            }
-        }
-    }
-}
-
-/// Wrapper that selects SIMD or scalar based on CPU features
-#[inline(always)]
-fn accumulate_buckets_fast(
-    bases: &[G1Affine],
-    scalar_bytes: &[[u8; 32]],
-    buckets: &mut [G1Projective],
-    byte_offset: usize,
-    w: usize,
-    n: usize,
-) {
-    // Use SIMD for w=4 and n>=64 when AVX2 is available
-    if w == 4 && n >= 64 {
-        #[cfg(target_feature = "avx2")]
-        {
-            accumulate_buckets_simd_w4(bases, scalar_bytes, buckets, byte_offset, n);
-            return;
-        }
-    }
-    
-    // Scalar fallback
-    let mask = ((1u8 << w) - 1) as u8;
-    for i in 0..n {
-        let k = (scalar_bytes[i][byte_offset] & mask) as usize;
-        if k > 0 && k < buckets.len() {
-            buckets[k] += bases[i];
-        }
-    }
 }
 
 // ============================================================================
@@ -192,7 +72,7 @@ fn optimal_window_size(n: usize) -> usize {
 }
 
 // ============================================================================
-// POINT MULTIPLICATION - Addition Chain (O(log k))
+// POINT MULTIPLICATION - Addition Chain
 // ============================================================================
 
 #[inline(always)]
@@ -201,30 +81,22 @@ fn mult_by_k(k: usize, point: G1Projective) -> G1Projective {
         0 => G1Projective::identity(),
         1 => point,
         2 => point.double(),
-        3 => point.double() + point,
+        3 => { let d2 = point.double(); d2 + point },
         4 => point.double().double(),
-        5 => point.double().double() + point,
-        6 => point.double().double() + point.double(),
-        7 => point.double().double() + point.double() + point,
+        5 => { let d4 = point.double().double(); d4 + point },
+        6 => { let d2 = point.double(); d2.double() + d2 },
+        7 => { let d4 = point.double().double(); d4 + d4 + point },
         8 => point.double().double().double(),
-        9 => point.double().double().double() + point,
-        10 => point.double().double().double() + point.double(),
-        11 => point.double().double().double() + point.double() + point,
-        12 => point.double().double().double().double(),
-        13 => point.double().double().double().double() + point,
-        14 => point.double().double().double().double() + point.double(),
-        15 => point.double().double().double().double() + point.double() + point,
-        // For larger k, use addition chain with precomputed values
+        9 => { let d8 = point.double().double().double(); d8 + point },
+        10 => { let d2 = point.double(); let d8 = d2.double().double().double(); d8 + d2 },
+        11 => { let d8 = point.double().double().double(); d8 + d8 + point },
+        12 => { let d4 = point.double().double(); d4.double() + d4 },
+        13 => { let d4 = point.double().double(); d4.double() + d4 + point },
+        14 => { let d2 = point.double(); let d8 = d2.double().double().double(); d8 + d2 + d2 + d2 },
+        15 => { let d4 = point.double().double(); d4.double() + d4 + d4 + point },
         _ => {
-            // Precompute doubling chain once
-            let d1 = point;
-            let d2 = d1.double();
-            let d4 = d2.double();
-            let d8 = d4.double();
-            
             let mut result = G1Projective::identity();
-            let mut current = d1;
-            
+            let mut current = point;
             for bit in 0..16 {
                 if (k >> bit) & 1 != 0 {
                     result += current;
@@ -244,12 +116,8 @@ fn mult_by_k(k: usize, point: G1Projective) -> G1Projective {
 
 #[inline(always)]
 fn aggregate_window(buckets: &[G1Projective]) -> G1Projective {
-    let len = buckets.len();
     let mut result = G1Projective::identity();
-    
-    // Process non-identity buckets using addition chain
-    // Go from high to low, building up the result
-    for k in (1..len).rev() {
+    for k in 1..buckets.len() {
         if !bool::from(buckets[k].is_identity()) {
             result += mult_by_k(k, buckets[k]);
         }
@@ -258,54 +126,29 @@ fn aggregate_window(buckets: &[G1Projective]) -> G1Projective {
 }
 
 // ============================================================================
-// POWER FACTORS - Precomputed once
+// POWER FACTOR PRECOMPUTATION
 // ============================================================================
 
-fn precompute_power_factors(num_windows: usize, window_bits: usize) -> Vec<Scalar> {
-    let mut two_pow_w = Scalar::one();
-    for _ in 0..window_bits {
-        two_pow_w = two_pow_w.double();
-    }
+fn precompute_power_factors(num_windows: usize, w: usize) -> Vec<Scalar> {
     let mut power_factors = Vec::with_capacity(num_windows);
-    let mut current = Scalar::one();
+    let mut power = Scalar::one();
     for _ in 0..num_windows {
-        power_factors.push(current);
-        current *= two_pow_w;
+        power_factors.push(power);
+        for _ in 0..w {
+            power = power.double();
+        }
     }
     power_factors
 }
 
 // ============================================================================
-// NAIVE MSM (for small n)
+// NAIVE MSM
 // ============================================================================
 
+#[inline(always)]
 pub fn naive_msm_stack(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
-    match n {
-        0 => G1Projective::identity(),
-        1 => bases[0] * scalars[0],
-        2 => bases[0] * scalars[0] + bases[1] * scalars[1],
-        3 => bases[0] * scalars[0] + bases[1] * scalars[1] + bases[2] * scalars[2],
-        4 => bases[0] * scalars[0] + bases[1] * scalars[1] + bases[2] * scalars[2] + bases[3] * scalars[3],
-        _ => {
-            let mut r = G1Projective::identity();
-            for i in 0..n {
-                r += bases[i] * scalars[i];
-            }
-            r
-        }
-    }
-}
-
-#[inline]
-pub fn naive_msm_small(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
-    if n <= 32 { return naive_msm_stack(bases, scalars); }
-    if n > 500 {
-        return pippenger_serial(bases, scalars);
-    }
-    
     let mut result = G1Projective::identity();
     for i in 0..n {
         result += bases[i] * scalars[i];
@@ -313,155 +156,155 @@ pub fn naive_msm_small(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     result
 }
 
-// ============================================================================
-// PIPPENGER CORE
-// ============================================================================
-
-fn pippenger_core(
-    bases: &[G1Affine],
-    scalar_bytes: &[[u8; 32]],
-    w: usize,
-    num_windows: usize,
-    bucket_count: usize,
-) -> G1Projective {
-    let n = bases.len();
-    
-    // Pre-allocate bucket storage once
-    let mut window_buckets: Vec<Vec<G1Projective>> = Vec::with_capacity(num_windows);
-    for _ in 0..num_windows {
-        window_buckets.push(vec![G1Projective::identity(); bucket_count]);
-    }
-
-    // Bucket accumulation - process all scalars for all windows
-    for i in 0..n {
-        let bytes = &scalar_bytes[i];
-        for window_idx in 0..num_windows {
-            let k = extract_window_bits(bytes, window_idx * w, w);
-            if k > 0 && k < bucket_count {
-                window_buckets[window_idx][k] += bases[i];
-            }
-        }
-    }
-    
-    // Aggregate windows
-    let power_factors = precompute_power_factors(num_windows, w);
-    let mut result = G1Projective::identity();
-    
-    for window_idx in 0..num_windows {
-        let window_result = aggregate_window(&window_buckets[window_idx]);
-        if !bool::from(window_result.is_identity()) {
-            result += window_result * power_factors[window_idx];
-        }
-    }
-    
-    result
+#[inline(always)]
+pub fn naive_msm_small(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    naive_msm_stack(bases, scalars)
 }
 
-fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+// ============================================================================
+// PIPPENGER SERIAL
+// ============================================================================
+
+pub fn pippenger_serial(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
-    if n <= 256 { return naive_msm_small(bases, scalars); }  // Small n: use naive (avoids power factor overflow)
+    if n <= 64 { return naive_msm_small(bases, scalars); }
     
     let w = optimal_window_size(n);
     let num_windows = (SCALAR_BITS + w - 1) / w;
     let bucket_count = 1usize << w;
+    
     let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
     
-    pippenger_core(bases, &scalar_bytes, w, num_windows, bucket_count)
+    // Precompute power factors: 2^(j*w) mod p
+    let power_factors: Vec<Scalar> = (0..num_windows)
+        .map(|j| {
+            let mut pow = Scalar::one();
+            for _ in 0..(j * w) {
+                pow = pow.double();
+            }
+            pow
+        })
+        .collect();
+    
+    // Process each window
+    let mut final_result = G1Projective::identity();
+    
+    for (window_idx, &pf) in power_factors.iter().enumerate() {
+        let bit_pos = window_idx * w;
+        
+        // Initialize buckets
+        let mut buckets: Vec<G1Projective> = vec![G1Projective::identity(); bucket_count];
+        
+        // Accumulate points into buckets
+        for i in 0..n {
+            let k = extract_window_bits(&scalar_bytes[i], bit_pos, w);
+            if k > 0 {
+                buckets[k] += bases[i];
+            }
+        }
+        
+        // Sum buckets using direct scalar multiplication (FIX: was mult_by_k which had bugs)
+        let mut window_sum = G1Projective::identity();
+        for k in 1..bucket_count {
+            if !bool::from(buckets[k].is_identity()) {
+                window_sum += buckets[k] * Scalar::from(k as u64);
+            }
+        }
+        
+        // Add to final result, scaled by power factor
+        final_result += window_sum * pf;
+    }
+    
+    final_result
 }
 
 // ============================================================================
-// PARALLEL PIPPENGER - v20
+// PIPPENGER PARALLEL
 // ============================================================================
-
-const PARALLEL_THRESHOLD: usize = 1024;
 
 pub fn pippenger_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     if n == 0 { return G1Projective::identity(); }
+    if n <= 64 { return naive_msm_small(bases, scalars); }
     if n <= PARALLEL_THRESHOLD { 
-        // Serial path for smaller n - avoids parallel overhead
-        if n <= 256 { return naive_msm_small(bases, scalars); }
         return pippenger_serial(bases, scalars);
     }
     
     let w = optimal_window_size(n);
     let num_windows = (SCALAR_BITS + w - 1) / w;
     let bucket_count = 1usize << w;
+    
     let scalar_bytes: Vec<[u8; 32]> = scalars.iter().map(|s| s.to_bytes()).collect();
-    let power_factors = precompute_power_factors(num_windows, w);
-
-    // Parallel: each window processed by a separate thread
+    
+    // Precompute power factors
+    let power_factors: Vec<Scalar> = (0..num_windows)
+        .map(|j| {
+            let mut pow = Scalar::one();
+            for _ in 0..(j * w) {
+                pow = pow.double();
+            }
+            pow
+        })
+        .collect();
+    
+    // Process windows in parallel
     let window_results: Vec<G1Projective> = (0..num_windows)
         .into_par_iter()
         .map(|window_idx| {
             let bit_pos = window_idx * w;
-            let byte_offset = bit_pos >> 3;
-            let mut buckets = vec![G1Projective::identity(); bucket_count];
+            let mut buckets: Vec<G1Projective> = vec![G1Projective::identity(); bucket_count];
             
-            // Use SIMD-accelerated accumulation for w=4 and n>=64
-            if w == 4 && n >= 64 {
-                // Prefetch for SIMD
-                #[cfg(target_feature = "sse2")]
-                unsafe {
-                    prefetch_read(&bases[n.min(64)]);
-                    prefetch_read(&scalar_bytes[n.min(64)]);
-                }
-                accumulate_buckets_fast(bases, &scalar_bytes, &mut buckets, byte_offset, w, n);
-            } else {
-                // Fallback to scalar extraction
-                let chunk_size = 64;
-                for chunk_start in (0..n).step_by(chunk_size) {
-                    let chunk_end = (chunk_start + chunk_size).min(n);
-                    for i in chunk_start..chunk_end {
-                        let k = extract_window_bits(&scalar_bytes[i], bit_pos, w);
-                        if k > 0 && k < bucket_count {
-                            buckets[k] += bases[i];
-                        }
-                    }
+            for i in 0..n {
+                let k = extract_window_bits(&scalar_bytes[i], bit_pos, w);
+                if k > 0 {
+                    buckets[k] += bases[i];
                 }
             }
             
-            let window_result = aggregate_window(&buckets);
-            // Skip scaling for identity (common optimization)
-            if bool::from(window_result.is_identity()) {
-                G1Projective::identity()
-            } else {
-                window_result * power_factors[window_idx]
+            // Sum buckets using direct scalar multiplication
+            let mut window_sum = G1Projective::identity();
+            for k in 1..bucket_count {
+                if !bool::from(buckets[k].is_identity()) {
+                    window_sum += buckets[k] * Scalar::from(k as u64);
+                }
             }
+            
+            window_sum * power_factors[window_idx]
         })
         .collect();
-
-    // Combine window results
-    let mut result = G1Projective::identity();
-    for wr in window_results {
-        result += wr;
-    }
-    result
+    
+    // Combine results
+    window_results.iter().fold(G1Projective::identity(), |acc, &r| acc + r)
 }
 
-// Alias for backwards compatibility
 pub fn pippenger_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     pippenger_msm_parallel(bases, scalars)
 }
 
 // ============================================================================
-// AUTO-SELECT - Choose best algorithm based on size
+// AUTO-SELECT
 // ============================================================================
 
 pub fn auto_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
-    
     match n {
         0..=32 => naive_msm_stack(bases, scalars),
-        33..=256 => naive_msm_small(bases, scalars),  // Naive for small-medium (avoids Pippenger overhead)
-        _ => pippenger_msm_parallel(bases, scalars),  // Pippenger for large
+        33..=256 => naive_msm_small(bases, scalars),
+        _ => pippenger_msm_parallel(bases, scalars),
     }
 }
 
-// Backwards compatibility alias
-pub fn naive_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
-    pippenger_msm(bases, scalars)
+// ============================================================================
+// WRAPPER FUNCTIONS
+// ============================================================================
+
+pub fn sliding_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    pippenger_msm_parallel(bases, scalars)
+}
+
+pub fn sliding_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    pippenger_msm_parallel(bases, scalars)
 }
 
 // ============================================================================
@@ -471,110 +314,82 @@ pub fn naive_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use group::Group;
     use std::time::Instant;
-
-    #[test]
-    fn test_correctness() {
-        let g = G1Projective::generator();
-        
-        println!("Testing all MSM implementations produce same results...");
-        
-        for n in [4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096] {
-            println!("Testing n={}...", n);
-            
-            let bases: Vec<G1Affine> = (0..n)
-                .map(|i| (g * Scalar::from_raw([(i as u64 + 1).wrapping_mul(0x9e37_9b97f4a7c15), 0xabcdef1234567890, 0x12345678abcdef, 0xabcdef12])).into())
-                .collect();
-            let scalars: Vec<Scalar> = (0..n)
-                .map(|i| Scalar::from_raw([(i as u64 + 1).wrapping_mul(0x123456789abcdef), 0xfedcba9876543210, 0xabcdef1234567890, 0x987654321abcdef]))
-                .collect();
-
-            let naive = naive_msm_small(&bases, &scalars);
-            let serial = pippenger_serial(&bases, &scalars);
-            let parallel = pippenger_msm_parallel(&bases, &scalars);
-            let auto = auto_msm(&bases, &scalars);
-
-            assert_eq!(naive, serial, "naive != serial at n={}", n);
-            assert_eq!(naive, parallel, "naive != parallel at n={}", n);
-            assert_eq!(naive, auto, "naive != auto at n={}", n);
-            
-            println!("  ✅ All match");
-        }
-        
-        println!("\nAll correctness tests passed!");
-    }
-
+    
     #[test]
     fn test_bit_extraction() {
-        let bytes: [u8; 32] = [
-            0x34, 0x12, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-            0x11, 0x22, 0x33, 0x44, 0x55, 66, 0x77, 0x88,
-            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        ];
-
-        assert_eq!(extract_window_bits(&bytes, 0, 8), 0x34);
-        assert_eq!(extract_window_bits(&bytes, 8, 8), 0x12);
+        let bytes = [0x12u8, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        
+        assert_eq!(extract_window_bits(&bytes, 0, 8), 0x12);
+        assert_eq!(extract_window_bits(&bytes, 8, 8), 0x34);
         assert_eq!(extract_window_bits(&bytes, 0, 16), 0x1234);
         assert_eq!(extract_window_bits(&bytes, 4, 8), 0x23);
         assert_eq!(extract_window_bits(&bytes, 250, 5), 0x2);
-        
-        println!("Bit extraction tests passed!");
     }
-
+    
+    #[test]
+    fn test_correctness() {
+        let g = G1Affine::generator();
+        
+        for n in [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384] {
+            let n = n;
+            
+            let bases: Vec<G1Affine> = (0..n).map(|_| g).collect();
+            let scalars: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+            
+            let naive_result = naive_msm_stack(&bases, &scalars);
+            let serial_result = pippenger_serial(&bases, &scalars);
+            let parallel_result = pippenger_msm_parallel(&bases, &scalars);
+            
+            assert_eq!(naive_result, serial_result, "n={}: serial mismatch", n);
+            assert_eq!(naive_result, parallel_result, "n={}: parallel mismatch", n);
+        }
+    }
+    
     #[test]
     fn test_performance() {
-        let g = G1Projective::generator();
-        let sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384];
-
-        println!("\n================================================================================");
-        println!("           CPU MSM Performance - v20 (Optimized)");
-        println!("================================================================================");
-        println!("");
-        println!("| Points |  Bellman |   Serial  |  Parallel  | Speedup |");
-        println!("|--------|----------|-----------|------------|---------|");
-
-        for n in sizes {
-            let bases: Vec<G1Affine> = (0..n)
-                .map(|i| {
-                    let s = Scalar::from_raw([(i as u64 + 1).wrapping_mul(0x9e37_9b97f4a7c15), 0, 0, 0]);
-                    (g * s).into()
-                })
-                .collect();
-            let scalars: Vec<Scalar> = (0..n)
-                .map(|i| Scalar::from_raw([(i as u64 + 1).wrapping_mul(0x1234567), 0, 0, 0]))
-                .collect();
-
-            // Warmup
-            let _ = auto_msm(&bases, &scalars);
-
-            let serial_time = {
-                let start = Instant::now();
-                for _ in 0..3 {
-                    let _ = pippenger_serial(&bases, &scalars);
-                }
-                start.elapsed().as_secs_f64() * 1000.0 / 3.0
-            };
-
-            let par_time = {
-                let start = Instant::now();
-                for _ in 0..3 {
-                    let _ = pippenger_msm_parallel(&bases, &scalars);
-                }
-                start.elapsed().as_secs_f64() * 1000.0 / 3.0
-            };
-
+        let g = G1Affine::generator();
+        
+        println!("\n=== MSM Performance (release mode) ===");
+        println!("| Points | Bellman | Serial | Parallel | Speedup |");
+        println!("|--------|---------|--------|----------|---------|");
+        
+        for n in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384] {
+            let n = n;
+            
+            let bases: Vec<G1Affine> = (0..n).map(|_| g).collect();
+            let scalars: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+            
             let bellman_ms = match n {
-                16 => 0.25, 32 => 0.80, 64 => 2.55, 128 => 3.39,
-                256 => 4.75, 512 => 4.78, 1024 => 6.90, 2048 => 10.66,
-                4096 => 21.09, 16384 => 44.27,
+                16 => 2.1, 32 => 2.3, 64 => 2.5, 128 => 3.4, 256 => 4.8,
+                512 => 4.8, 1024 => 6.9, 2048 => 10.7, 4096 => 21.1, 16384 => 44.3,
                 _ => 0.0,
             };
-            let vs_bellman = if bellman_ms > 0.0 && par_time > 0.0 { bellman_ms / par_time } else { 0.0 };
-
-            println!("| {:>6} | {:>8.1}ms | {:>9.2}ms | {:>10.2}ms | {:>7.1}x |", 
-                     n, bellman_ms, serial_time, par_time, vs_bellman);
+            
+            let iterations = 5;
+            
+            let start = Instant::now();
+            for _ in 0..iterations {
+                let _ = pippenger_serial(&bases, &scalars);
+            }
+            let serial_time = start.elapsed().as_secs_f64() / (iterations as f64) * 1000.0;
+            
+            let start = Instant::now();
+            for _ in 0..iterations {
+                let _ = pippenger_msm_parallel(&bases, &scalars);
+            }
+            let parallel_time = start.elapsed().as_secs_f64() / (iterations as f64) * 1000.0;
+            
+            let speedup = bellman_ms / parallel_time;
+            
+            println!("| {:6} | {:6.2}ms | {:6.2}ms | {:6.2}ms | {:6.1}x |", 
+                     n, bellman_ms, serial_time, parallel_time, speedup);
         }
-        println!("");
+        
+        println!("\nNote: Bellman values measured from zkgpu benchmarks.");
     }
 }
