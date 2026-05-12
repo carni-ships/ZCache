@@ -4,7 +4,7 @@
 //! Bellman estimates based on Zcash's standard Pippenger implementation.
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
-use cpu_msm_optimized::{auto_msm, pippenger_msm, pippenger_msm_parallel, naive_msm};
+use cpu_msm_optimized::{auto_msm, pippenger_msm, pippenger_msm_parallel, naive_msm_stack as naive_msm};
 use std::time::Instant;
 
 fn main() {

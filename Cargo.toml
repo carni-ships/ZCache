@@ -10,10 +10,3 @@ rayon = "1.10"
 lazy_static = "1.4"
 rand = "0.8"
 group = "0.13"
-
-[dev-dependencies]
-criterion = "0.5"
-
-[[bench]]
-name = "bench"
-harness = false
