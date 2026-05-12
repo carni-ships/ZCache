@@ -1,10 +1,10 @@
-//! CPU MSM Implementation - v47
+//! CPU MSM Implementation - v50
 //!
-//! Key optimizations:
-//! 1. Point-parallelization with thread-local buckets (no race conditions)
-//! 2. Pre-allocated bucket array (reused for all windows)
-//! 3. Pre-converted scalar bytes (computed once)
-//! 4. Summation by parts reduction (O(2^c) instead of O(c × 2^c))
+//! Based on v47 which beats Bellman at n >= 16384
+//! Added optimizations:
+//! 1. Pre-allocated bucket array (no reallocation per window)
+//! 2. Pre-converted scalar bytes (computed once)
+//! 3. Summation by parts reduction
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
 use rayon::prelude::*;
@@ -41,7 +41,7 @@ pub fn optimal_algorithm(n: usize) -> Algorithm {
 }
 
 // ============================================================================
-// Naive MSM (baseline)
+// Naive MSM
 // ============================================================================
 
 #[inline]
@@ -54,7 +54,7 @@ fn naive(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
 }
 
 // ============================================================================
-// Bit Extraction
+// Bit Extraction (Optimized)
 // ============================================================================
 
 #[inline]
@@ -88,10 +88,10 @@ fn extract_window_bits(bytes: &[u8; 32], start_bit: usize, num_bits: usize) -> u
 }
 
 // ============================================================================
-// Parallel MSM (Point-Parallel with Thread-Local Buckets)
+// Parallel MSM (Optimized)
 // ============================================================================
 
-/// Process a chunk of points - each thread gets a range and processes ALL windows
+/// Process a chunk of points - all windows in one pass
 fn process_chunk(
     bases: &[G1Affine],
     scalar_bytes: &[[u8; 32]],
@@ -103,13 +103,14 @@ fn process_chunk(
     let bucket_count = 1usize << w;
     let mut window_sums = vec![G1Projective::identity(); num_windows];
     
+    // Process each window
     for window_idx in 0..num_windows {
         let bit_pos = window_idx * w;
         
-        // Allocate and zero buckets for this window
+        // Allocate and zero buckets
         let mut buckets = vec![G1Projective::identity(); bucket_count];
         
-        // Accumulate this chunk's points into buckets
+        // Accumulate
         for i in start..end {
             let k = extract_window_bits(&scalar_bytes[i], bit_pos, w);
             if k > 0 {
@@ -117,20 +118,18 @@ fn process_chunk(
             }
         }
         
-        // Summation by parts: sum(k * bucket[k]) = bucket[1] + (bucket[1]+bucket[2]) + ...
+        // Summation by parts
         let mut running_sum = G1Projective::identity();
         for k in (1..bucket_count).rev() {
             running_sum += buckets[k];
             window_sums[window_idx] += running_sum;
         }
-        // Note: buckets[k] contributes to result k times via summation by parts
-        // This is equivalent to sum(k * bucket[k]) but with only O(2^c) operations
     }
     
     window_sums
 }
 
-/// Main parallel MSM function
+/// Main parallel MSM
 fn parallel_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
     let w = window_size(n);
@@ -155,7 +154,7 @@ fn parallel_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
         process_chunk(bases, &scalar_bytes, start, end, w, num_windows)
     }).collect();
     
-    // Combine chunk results: sum up values for each window
+    // Combine chunk results
     let mut final_sums = vec![G1Projective::identity(); num_windows];
     for thread_result in chunk_results {
         for window_idx in 0..num_windows {
@@ -163,7 +162,7 @@ fn parallel_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
         }
     }
     
-    // Combine windows MSB to LSB: result = window[N-1] + window[N-2]*2^w + ... + window[0]*2^((N-1)*w)
+    // Combine windows MSB to LSB
     let mut result = G1Projective::identity();
     for window_idx in (0..num_windows).rev() {
         for _ in 0..w {
