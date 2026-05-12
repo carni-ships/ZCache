@@ -5,7 +5,7 @@
 use std::time::Instant;
 use std::sync::Arc;
 use bls12_381::{G1Affine, G1Projective, Scalar};
-use cpu_msm_optimized::{auto_msm, bellman_style_multiexp, naive_msm_stack};
+use cpu_msm_optimized::{auto_msm, bellman_style_multiexp, bellman_style_multiexp_parallel, naive_msm_stack};
 
 use bellman::multiexp::{multiexp, FullDensity};
 use bellman::multicore::Worker;
