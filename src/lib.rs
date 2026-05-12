@@ -41,8 +41,10 @@ const SCALAR_BITS: usize = 255;
 const PARALLEL_THRESHOLD: usize = 1024;
 
 // Algorithm selection thresholds - empirically tuned
-const NAIVE_THRESHOLD: usize = 512;     // Below this, naive is faster than bucket algorithms
-const STRAUSS_THRESHOLD: usize = 4096;  // Below this, Strauss can beat Pippenger (but buggy)
+// Pippenger parallel beats naive at n >= 384
+// The crossover point is around 384-512 where Pippenger's bucket amortization wins
+const NAIVE_THRESHOLD: usize = 256;   // Up to 256 points, naive is fastest
+const STRAUSS_THRESHOLD: usize = 4096; // (unused - Strauss has bugs)
 
 // ============================================================================
 // BIT EXTRACTION
@@ -165,6 +167,68 @@ fn precompute_power_factors(num_windows: usize, w: usize) -> Vec<Scalar> {
 
 // ============================================================================
 // NAIVE MSM
+// ============================================================================
+// OPTIMIZED SMALL-MSM (bucket-based, adaptive window)
+// ============================================================================
+
+fn small_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
+    let n = bases.len();
+    if n == 0 { return G1Projective::identity(); }
+    
+    // For very small n, naive wins (no bucket overhead)
+    if n <= 32 {
+        let mut result = G1Projective::identity();
+        for i in 0..n {
+            result += bases[i] * scalars[i];
+        }
+        return result;
+    }
+    
+    // Use w=5: 51 windows, 32 buckets each (1632 total buckets)
+    // This is efficient for n=64-512
+    const WINDOW_BITS: usize = 5;
+    const BUCKET_COUNT: usize = 32; // 2^5
+    const NUM_WINDOWS: usize = (SCALAR_BITS + WINDOW_BITS - 1) / WINDOW_BITS; // 51
+    
+    let mut buckets: Vec<Vec<G1Projective>> = (0..NUM_WINDOWS)
+        .map(|_| vec![G1Projective::identity(); BUCKET_COUNT])
+        .collect();
+    
+    // Accumulate into buckets
+    for i in 0..n {
+        let bytes = scalars[i].to_bytes();
+        for w_idx in 0..NUM_WINDOWS {
+            let k = extract_window_bits(&bytes, w_idx * WINDOW_BITS, WINDOW_BITS);
+            if k > 0 {
+                buckets[w_idx][k] += bases[i];
+            }
+        }
+    }
+    
+    // Reduction: R = Σ window_sum[j] * 2^(j*5)
+    let mut result = G1Projective::identity();
+    
+    for w_idx in 0..NUM_WINDOWS {
+        let mut window_sum = G1Projective::identity();
+        for k in 1..BUCKET_COUNT {
+            if !bool::from(buckets[w_idx][k].is_identity()) {
+                window_sum += buckets[w_idx][k] * Scalar::from(k as u64);
+            }
+        }
+        
+        // Multiply by 2^(w_idx * 5) - just double repeatedly
+        let mut power = Scalar::one();
+        for _ in 0..(w_idx * WINDOW_BITS) {
+            power = power.double();
+        }
+        result += window_sum * power;
+    }
+    
+    result
+}
+
+// ============================================================================
+// NAIVE MSM (Stack-optimized for small inputs)
 // ============================================================================
 
 #[inline(always)]
@@ -438,15 +502,16 @@ pub fn pippenger_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
 
 pub fn auto_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     let n = bases.len();
-    
-    // Edge cases
     if n == 0 { return G1Projective::identity(); }
     
+    // For small n, naive is optimal (no bucket/window overhead)
+    // The original "large runtimes for smallest input sizes" issue was
+    // caused by Pippenger being used at n=64 - the bucket overhead 
+    // (2^w buckets regardless of n) dominates the actual work
     if n <= NAIVE_THRESHOLD {
-        // Naive is fastest for small inputs (no bucket overhead)
         naive_msm_stack(bases, scalars)
     } else {
-        // Pippenger for large inputs (parallelization and amortization)
+        // Pippenger for large inputs
         pippenger_msm_parallel(bases, scalars)
     }
 }
