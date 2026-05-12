@@ -5,7 +5,7 @@
 use std::time::Instant;
 use std::sync::Arc;
 use bls12_381::{G1Affine, G1Projective, Scalar};
-use cpu_msm_optimized::{auto_msm, bellman_style_multiexp, bellman_style_multiexp_parallel, naive_msm_stack};
+use cpu_msm_optimized::{auto_msm, naive_msm_stack};
 
 use bellman::multiexp::{multiexp, FullDensity};
 use bellman::multicore::Worker;
@@ -94,7 +94,7 @@ fn main() {
         
         let ours_time = {
             let start = Instant::now();
-            for _ in 0..3 { let _ = bellman_style_multiexp(&bases, &scalars); }
+            for _ in 0..3 { let _ = auto_msm(&bases, &scalars); }
             start.elapsed().as_secs_f64() * 1000.0 / 3.0
         };
         
