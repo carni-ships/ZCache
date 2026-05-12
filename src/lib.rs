@@ -1,4 +1,4 @@
-//! CPU MSM Implementation - v20
+//! CPU MSM Implementation - v21
 //!
 //! Optimizations:
 //! 1. **Adaptive Window Sizing** - Optimal w based on n  
@@ -8,6 +8,7 @@
 //! 5. **Identity Skip Optimization** - Avoid unnecessary operations on zero buckets
 //! 6. **Memory Prefetch Hints** - CPU cache hints for better locality
 //! 7. **Addition Chain Aggregation** - O(k) instead of O(k log k) per window
+//! 8. **SIMD Bit Extraction** - Process 4 scalars at once (x86 AVX2)
 
 use bls12_381::{G1Affine, G1Projective, Scalar};
 use rayon::prelude::*;
@@ -69,6 +70,110 @@ fn prefetch_read<T>(ptr: *const T) {
     #[cfg(target_feature = "sse2")]
     unsafe {
         std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
+// ============================================================================
+// SIMD ACCELERATION (x86 AVX2)
+// ============================================================================
+
+/// SIMD-accelerated bucket accumulation for w=4 (4 bits)
+/// Processes 8 scalars at once using AVX2 if available
+fn accumulate_buckets_simd_w4(
+    bases: &[G1Affine],
+    scalar_bytes: &[[u8; 32]],
+    buckets: &mut [G1Projective],
+    byte_offset: usize,
+    n: usize,
+) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        // Flatten scalar_bytes for SIMD-friendly access
+        let flat: Vec<u8> = scalar_bytes.iter().flat_map(|s| s.iter().copied()).collect();
+        
+        // 8 scalars per AVX2 iteration (256 bits)
+        let mut i = 0;
+        let n_rounded = (n / 8) * 8;
+        
+        while i < n_rounded {
+            // Prefetch next 8 scalars
+            std::arch::x86_64::_mm_prefetch(
+                flat.as_ptr().add((i + 64) * 32) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+            
+            // Extract 8 window values (bits 0-3 from byte at byte_offset)
+            let k = [
+                flat[i * 32 + byte_offset] as usize,
+                flat[(i + 1) * 32 + byte_offset] as usize,
+                flat[(i + 2) * 32 + byte_offset] as usize,
+                flat[(i + 3) * 32 + byte_offset] as usize,
+                flat[(i + 4) * 32 + byte_offset] as usize,
+                flat[(i + 5) * 32 + byte_offset] as usize,
+                flat[(i + 6) * 32 + byte_offset] as usize,
+                flat[(i + 7) * 32 + byte_offset] as usize,
+            ];
+            
+            // Add to buckets
+            for j in 0..8 {
+                let idx = i + j;
+                if k[j] > 0 {
+                    buckets[k[j]] += bases[idx];
+                }
+            }
+            
+            i += 8;
+        }
+        
+        // Handle remaining scalars
+        while i < n {
+            let k = flat[i * 32 + byte_offset] as usize;
+            if k > 0 {
+                buckets[k] += bases[i];
+            }
+            i += 1;
+        }
+    }
+    
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        // Scalar fallback - this won't be reached if avx2 is enabled
+        let mask = 0xF;
+        for i in 0..n {
+            let k = (scalar_bytes[i][byte_offset] & mask) as usize;
+            if k > 0 && k < buckets.len() {
+                buckets[k] += bases[i];
+            }
+        }
+    }
+}
+
+/// Wrapper that selects SIMD or scalar based on CPU features
+#[inline(always)]
+fn accumulate_buckets_fast(
+    bases: &[G1Affine],
+    scalar_bytes: &[[u8; 32]],
+    buckets: &mut [G1Projective],
+    byte_offset: usize,
+    w: usize,
+    n: usize,
+) {
+    // Use SIMD for w=4 and n>=64 when AVX2 is available
+    if w == 4 && n >= 64 {
+        #[cfg(target_feature = "avx2")]
+        {
+            accumulate_buckets_simd_w4(bases, scalar_bytes, buckets, byte_offset, n);
+            return;
+        }
+    }
+    
+    // Scalar fallback
+    let mask = ((1u8 << w) - 1) as u8;
+    for i in 0..n {
+        let k = (scalar_bytes[i][byte_offset] & mask) as usize;
+        if k > 0 && k < buckets.len() {
+            buckets[k] += bases[i];
+        }
     }
 }
 
@@ -291,22 +396,28 @@ pub fn pippenger_msm_parallel(bases: &[G1Affine], scalars: &[Scalar]) -> G1Proje
         .into_par_iter()
         .map(|window_idx| {
             let bit_pos = window_idx * w;
+            let byte_offset = bit_pos >> 3;
             let mut buckets = vec![G1Projective::identity(); bucket_count];
             
-            // Prefetch in chunks for better cache utilization
-            let chunk_size = 64;
-            for chunk_start in (0..n).step_by(chunk_size) {
-                let chunk_end = (chunk_start + chunk_size).min(n);
-                
-                // Prefetch next chunk
-                if chunk_end + chunk_size < n {
-                    prefetch_read(&scalar_bytes[chunk_end + chunk_size]);
+            // Use SIMD-accelerated accumulation for w=4 and n>=64
+            if w == 4 && n >= 64 {
+                // Prefetch for SIMD
+                #[cfg(target_feature = "sse2")]
+                unsafe {
+                    prefetch_read(&bases[n.min(64)]);
+                    prefetch_read(&scalar_bytes[n.min(64)]);
                 }
-                
-                for i in chunk_start..chunk_end {
-                    let k = extract_window_bits(&scalar_bytes[i], bit_pos, w);
-                    if k > 0 && k < bucket_count {
-                        buckets[k] += bases[i];
+                accumulate_buckets_fast(bases, &scalar_bytes, &mut buckets, byte_offset, w, n);
+            } else {
+                // Fallback to scalar extraction
+                let chunk_size = 64;
+                for chunk_start in (0..n).step_by(chunk_size) {
+                    let chunk_end = (chunk_start + chunk_size).min(n);
+                    for i in chunk_start..chunk_end {
+                        let k = extract_window_bits(&scalar_bytes[i], bit_pos, w);
+                        if k > 0 && k < bucket_count {
+                            buckets[k] += bases[i];
+                        }
                     }
                 }
             }
